@@ -18,13 +18,21 @@ It monitors critical equipment health (Vibration, Sound, Temperature, and Curren
 ### ✅ 2. Enterprise-Grade Security
 * **Mutual TLS (mTLS):** Both Server and Client must present valid X.509 certificates signed by our internal CA.
 * **Role-Based Access Control (RBAC):**
-    * **Admin:** Full control (calibration, shutdown).
-    * **Viewer:** Read-only access to dashboards.
+  * **Admin:** Full command access including `clear_log`.
+  * **Operator:** Monitoring + operational read access.
+  * **Maintenance:** Monitoring + maintenance read access.
+  * **Viewer:** Read-only telemetry and logs.
 * **Encryption:** All data uses AES-256-GCM encryption over TCP/IP.
 
-### ✅ 3. Advanced Data Handling
+### ✅ 3. Multi-Client Concurrency
+* **Thread-per-Client Server:** Each authenticated client runs in a dedicated worker thread.
+* **Session Accounting:** Server prints current active sessions and max observed sessions.
+* **Session Limit Enforcement:** New connections are rejected when max concurrent session limit is reached.
+
+### ✅ 4. Advanced Data Handling
 * **Live Monitor Mode:** Push-based streaming protocol sends updates every 1 second.
 * **Black Box Logger:** Automatically saves `CRITICAL` alerts to a non-volatile `blackbox.log` file on the device (Forensics).
+* **Thread-Safe Logging:** Black box writes are mutex-protected for concurrent sessions.
 * **Visual Dashboard:** Python-based GUI client providing real-time vibration, sound, temperature, and current graphs.
 
 ---
@@ -42,7 +50,7 @@ It monitors critical equipment health (Vibration, Sound, Temperature, and Curren
 │   QNX DRIVER LAYER      │       │     PROTOCOL LAYER      │
 │ (drivers/sensor_mgr.c)  │<─────>│  (protocol/protocol.c)  │
 │ - 1kHz Polling Thread   │ Data  │ - Command Parsing       │
-│ - I2C/ADC Read Logic    │       │ - Encryption            │
+│ - I2C/ADC Read Logic    │       │ - Role Authorization    │
 │ - Signal Accumulation   │       │ - Black Box Logging     │
 │ - Health Evaluation     │       │                         │
 └─────────────────────────┘       └─────────────────────────┘
@@ -50,7 +58,8 @@ It monitors critical equipment health (Vibration, Sound, Temperature, and Curren
              └───────────────┐                 │
                              ▼                 │
                   ┌─────────────────────────┐  │
-                  │    MAIN SERVER LOOP     │──┘
+                  │ MULTI-CLIENT SERVER     │──┘
+                  │  (thread-per-session)   │
                   │     (apps/server.c)     │
                   └─────────────────────────┘
 ```
@@ -84,19 +93,19 @@ i2c-bcm2711 -p i2c1
 ```
 .
 ├── apps/
-│   └── server.c           # Main entry point (Connection Handler)
+│   ├── server.c           # Main entry point (TLS listener + worker threads)
+│   └── client.c           # C-based Text Terminal Client
 ├── clients/
-│   ├── ims_client.c       # C-based Text Terminal Client
 │   └── dashboard.py       # Python Graphical Dashboard (Matplotlib)
 ├── common/
-│   ├── tls_helper.c       # OpenSSL Context & Certificate Loading
-│   └── ...
+│   ├── authorization.c    # Role extraction from certificate OU/CN
+│   └── authorization.h
 ├── drivers/
 │   ├── sensors.c          # Low-level QNX GPIO/I2C/1-Wire Mapping
 │   └── sensor_manager.c   # Background Polling Thread & Health Logic
 ├── protocol/
-│   ├── protocol.c         # Command Logic (Monitor, Log, Help)
-│   └── authorization.c    # Role extraction from Certificates
+│   ├── protocol.c         # Command logic + role permission checks
+│   └── protocol.h
 ├── scripts/
 │   └── quick_start.sh     # One-click Build & Deploy tool
 ├── certs/                 # Generated Keys & Certificates
@@ -166,7 +175,8 @@ Expected output:
 [INFO] GPIO initialized (Vibration: GPIO17, Sound: GPIO27)
 [INFO] I2C device opened: /dev/i2c1
 [INFO] DS18B20 temperature sensor initialized
-[INFO] Server listening on port 8443
+[INFO] Server listening on port 8080
+[SESSIONS] Current: 0 | Max Observed: 0 | Limit: 32
 ```
 
 ## Client Usage
@@ -206,8 +216,20 @@ Best for debugging and checking logs.
 | `get_health` | Returns current Snapshot (Healthy/Warning/Critical). |
 | `get_sensors` | Returns raw values (Vibration Events/sec, Sound Duty %, Temp °C, Current A). |
 | `get_log` | Downloads the blackbox.log file content from the server. |
+| `clear_log` | Clears blackbox.log (ADMIN only). |
 | `whoami` | Shows your Certificate Common Name and Access Role. |
 | `list_units` | Lists all registered machinery (e.g., "Sentinel-RT"). |
+
+### Command Permissions by Role
+
+| Role | Allowed Commands |
+|:-----|:-----------------|
+| ADMIN | `help`, `whoami`, `list_units`, `get_sensors`, `get_health`, `get_log`, `monitor`, `clear_log`, `quit` |
+| OPERATOR | `help`, `whoami`, `list_units`, `get_sensors`, `get_health`, `get_log`, `monitor`, `quit` |
+| MAINTENANCE | `help`, `whoami`, `list_units`, `get_sensors`, `get_health`, `get_log`, `monitor`, `quit` |
+| VIEWER | `help`, `whoami`, `list_units`, `get_sensors`, `get_health`, `get_log`, `quit` |
+
+Unauthorized command attempts receive a permission-denied response.
 
 ## Security Details (mTLS)
 
@@ -215,8 +237,20 @@ Best for debugging and checking logs.
 - **Identity:** Every client has a unique certificate (`client.crt`) signed by this CA.
 - **Verification:**
   - Server rejects any connection not signed by the CA.
-  - Server extracts the Role (Admin/User) from the certificate fields.
+  - Server extracts role from certificate OU and normalizes case.
+  - Role certificates are generated for `ADMIN`, `OPERATOR`, `VIEWER`, and `MAINTENANCE`.
+  - Unknown/missing OU defaults to `ADMIN` in the current implementation.
 - **Logging:** Every Critical Alert is timestamped and saved to disk (`blackbox.log`) for post-incident forensics.
+
+## Session Observability
+
+The server reports session state as clients connect/disconnect:
+
+```text
+[SESSIONS] Current: <active> | Max Observed: <peak> | Limit: <max>
+```
+
+If `<active>` reaches the limit, incoming connections are rejected until a slot is released.
 
 ## Sensor Details
 
@@ -298,6 +332,10 @@ Replace `<user_name>` with your actual QNX username.
 - **GPIO Devices:** `/dev/gpio17`, `/dev/gpio27`, `/dev/gpio4`
 - **I2C Bus:** `/dev/i2c1`
 - **Process Priority:** Server runs with default QNX scheduling policy (can be adjusted with `nice` or `renice`)
+
+### Threading Behavior on QNX
+- The server uses pthreads for worker sessions and sensor polling.
+- On QNX targets, pthread support is provided natively in libc (no explicit `-lpthread` needed).
 
 ## Future Roadmap
 
