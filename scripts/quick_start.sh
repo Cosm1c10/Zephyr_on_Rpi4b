@@ -45,13 +45,15 @@ generate_certs() {
     fi
 
     # Clients
-    ROLES=("admin" "operator" "viewer" "maintenance")
-    for role in "${ROLES[@]}"; do
-        CLIENT_NAME="${role}_client"
+    ROLES=("admin:ADMIN" "operator:OPERATOR" "viewer:VIEWER" "maintenance:MAINTENANCE")
+    for role_info in "${ROLES[@]}"; do
+        role_name="${role_info%%:*}"
+        role_ou="${role_info##*:}"
+        CLIENT_NAME="${role_name}_client"
         if [ ! -f "certs/${CLIENT_NAME}.key" ]; then
             log "Creating certificate for: $CLIENT_NAME"
             $OPENSSL_CMD genrsa -out "certs/${CLIENT_NAME}.key" 2048 2>/dev/null
-            $OPENSSL_CMD req -new -key "certs/${CLIENT_NAME}.key" -out "certs/${CLIENT_NAME}.csr" -subj "/CN=${CLIENT_NAME}/O=IMS/OU=${role}"
+            $OPENSSL_CMD req -new -key "certs/${CLIENT_NAME}.key" -out "certs/${CLIENT_NAME}.csr" -subj "/CN=${CLIENT_NAME}/O=IMS/OU=${role_ou}"
             $OPENSSL_CMD x509 -req -in "certs/${CLIENT_NAME}.csr" -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial -out "certs/${CLIENT_NAME}.crt" -days 365 -sha256
         fi
     done

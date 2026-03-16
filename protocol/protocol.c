@@ -6,12 +6,51 @@
 #include <sys/time.h>
 #include <openssl/ssl.h>
 #include <time.h>
+#include <pthread.h>
 
 #include "protocol.h"
 #include "authorization.h"
 #include "sensor_manager.h"
 
 #define EOM_MARKER '\x03'
+
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int role_can_execute(UserRole role, const char *command)
+{
+    if (!command)
+        return 0;
+
+    if (!strcmp(command, "help") ||
+        !strcmp(command, "whoami") ||
+        !strcmp(command, "list_units") ||
+        !strcmp(command, "get_sensors") ||
+        !strcmp(command, "get_health") ||
+        !strcmp(command, "get_log") ||
+        !strcmp(command, "quit") ||
+        !strcmp(command, "exit")) {
+        return 1;
+    }
+
+    if (!strcmp(command, "monitor"))
+        return role == ROLE_OPERATOR || role == ROLE_MAINTENANCE || role == ROLE_ADMIN;
+
+    if (!strcmp(command, "clear_log"))
+        return role == ROLE_ADMIN;
+
+    return 0;
+}
+
+static void send_permission_denied(ProtocolContext *ctx, const char *command)
+{
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "Permission denied for role %s on command '%s'.\n",
+             role_to_string(ctx->identity.role),
+             command ? command : "unknown");
+    send_response(ctx, msg);
+    send_eom(ctx);
+}
 
 /* ============================================================ */
 /* Helper Functions                                             */
@@ -31,9 +70,13 @@ void send_eom(ProtocolContext *ctx)
 
 void log_alert(const char *unit, const char *message)
 {
+    pthread_mutex_lock(&log_mutex);
+
     FILE *f = fopen("blackbox.log", "a");
-    if (!f)
+    if (!f) {
+        pthread_mutex_unlock(&log_mutex);
         return;
+    }
 
     time_t now = time(NULL);
     char *ts = ctime(&now);
@@ -41,6 +84,7 @@ void log_alert(const char *unit, const char *message)
 
     fprintf(f, "[%s] CRITICAL ALERT | Unit: %s | %s\n", ts, unit, message);
     fclose(f);
+    pthread_mutex_unlock(&log_mutex);
 }
 
 /* ============================================================ */
@@ -50,12 +94,17 @@ void log_alert(const char *unit, const char *message)
 void cmd_help(ProtocolContext *ctx)
 {
     send_response(ctx, "Available commands:\n");
-    send_response(ctx, "  monitor [time] - Live stream\n");
     send_response(ctx, "  list_units     - List equipment\n");
     send_response(ctx, "  get_sensors    - Raw sensors\n");
     send_response(ctx, "  get_health     - Health report\n");
     send_response(ctx, "  get_log        - Show blackbox.log\n");
-    send_response(ctx, "  clear_log      - Wipe blackbox.log\n");
+    if (ctx->identity.role == ROLE_OPERATOR ||
+        ctx->identity.role == ROLE_MAINTENANCE ||
+        ctx->identity.role == ROLE_ADMIN) {
+        send_response(ctx, "  monitor [time] - Live stream\n");
+    }
+    if (ctx->identity.role == ROLE_ADMIN)
+        send_response(ctx, "  clear_log      - Wipe blackbox.log\n");
     send_response(ctx, "  whoami         - Identity info\n");
     send_response(ctx, "  quit           - Disconnect session\n");
     send_eom(ctx);
@@ -243,15 +292,29 @@ void protocol_run(ProtocolContext *ctx)
 
         buf[n] = 0;
 
-        if (!strncmp(buf, "help", 4)) cmd_help(ctx);
-        else if (!strncmp(buf, "monitor", 7)) cmd_monitor(ctx, buf + 7);
-        else if (!strncmp(buf, "list_units", 10)) cmd_list_units(ctx);
-        else if (!strncmp(buf, "get_sensors", 11)) cmd_get_sensors(ctx);
-        else if (!strncmp(buf, "get_health", 10)) cmd_get_health(ctx);
-        else if (!strncmp(buf, "get_log", 7)) cmd_get_log(ctx);
-        else if (!strncmp(buf, "clear_log", 9)) cmd_clear_log(ctx);
-        else if (!strncmp(buf, "whoami", 6)) cmd_whoami(ctx);
-        else if (!strncmp(buf, "quit", 4) || !strncmp(buf, "exit", 4)) {
+        char command[64] = {0};
+        if (sscanf(buf, "%63s", command) != 1)
+            continue;
+
+        if (!role_can_execute(ctx->identity.role, command)) {
+            send_permission_denied(ctx, command);
+            continue;
+        }
+
+        if (!strcmp(command, "help")) cmd_help(ctx);
+        else if (!strcmp(command, "monitor")) {
+            char *args = buf + strlen("monitor");
+            while (*args == ' ' || *args == '\t')
+                args++;
+            cmd_monitor(ctx, args);
+        }
+        else if (!strcmp(command, "list_units")) cmd_list_units(ctx);
+        else if (!strcmp(command, "get_sensors")) cmd_get_sensors(ctx);
+        else if (!strcmp(command, "get_health")) cmd_get_health(ctx);
+        else if (!strcmp(command, "get_log")) cmd_get_log(ctx);
+        else if (!strcmp(command, "clear_log")) cmd_clear_log(ctx);
+        else if (!strcmp(command, "whoami")) cmd_whoami(ctx);
+        else if (!strcmp(command, "quit") || !strcmp(command, "exit")) {
             send_response(ctx, "\n>>> DISCONNECTING <<<\n");
             send_eom(ctx);
             ctx->running = 0; 

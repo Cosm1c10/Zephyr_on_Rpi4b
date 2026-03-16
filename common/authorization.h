@@ -6,6 +6,7 @@
 typedef enum {
     ROLE_VIEWER = 0,
     ROLE_OPERATOR,
+    ROLE_MAINTENANCE,
     ROLE_ADMIN,
     ROLE_UNAUTHORIZED
 } UserRole;
