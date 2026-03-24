@@ -1,10 +1,11 @@
-# Sentinel-RT — Industrial Equipment Health Dashboard
+# Sentinel-RT — Edge-Based Industrial Equipment Health Dashboard
 
-**Sentinel-RT** is a real-time industrial equipment monitoring system that runs on a **Raspberry Pi 4** using the **Zephyr RTOS**. It continuously reads vibration, sound, temperature, and current sensors and serves the data over a **Mutual TLS (mTLS) encrypted TCP connection** to remote clients. Access is controlled by a **Role-Based Access Control (RBAC)** system embedded in X.509 certificates.
+**Sentinel-RT** is a real-time industrial equipment monitoring system running on a **Raspberry Pi 4** under **Linux with the PREEMPT_RT patch**. It continuously reads vibration, sound, temperature, and current sensors and serves the data over a **Mutual TLS (mTLS) encrypted TCP connection** to remote clients. Access is governed by a **Role-Based Access Control (RBAC)** system whose roles are embedded directly in X.509 client certificates.
 
-> **RTOS:** Zephyr (migrated from QNX Neutrino 8.0)
-> **Board Target:** `rpi_4b`
-> **Security:** mTLS with MbedTLS
+> **Platform:** Raspberry Pi 4 Model B running Linux PREEMPT_RT (kernel 6.x-rt)
+> **Language:** C (gcc, POSIX threads, OpenSSL)
+> **Security:** mTLS 1.2/1.3 with OpenSSL, RBAC via X.509 OU field
+> **Scheduling:** `SCHED_FIFO` RT worker threads + `mlockall()` for deterministic latency
 > **Author:** Hemanth Kumar — [@Hemanthkumar04](https://github.com/Hemanthkumar04)
 
 ---
@@ -12,26 +13,24 @@
 ## Table of Contents
 
 1. [System Overview](#1-system-overview)
-2. [Repository Structure](#2-repository-structure)
-3. [Hardware Setup](#3-hardware-setup)
-4. [Host Machine Prerequisites](#4-host-machine-prerequisites)
-5. [Install the Zephyr SDK](#5-install-the-zephyr-sdk)
-6. [Set Up a West Workspace](#6-set-up-a-west-workspace)
-7. [Generate TLS Certificates](#7-generate-tls-certificates)
-8. [Embed Certificates into the Firmware](#8-embed-certificates-into-the-firmware)
-9. [Build the Zephyr Server Image](#9-build-the-zephyr-server-image)
-10. [Prepare the SD Card](#10-prepare-the-sd-card)
-11. [Flash / Deploy Zephyr to the Raspberry Pi 4](#11-flash--deploy-zephyr-to-the-raspberry-pi-4)
-12. [Monitor the Boot Console (UART)](#12-monitor-the-boot-console-uart)
-13. [Build the Linux Terminal Client](#13-build-the-linux-terminal-client)
-14. [Run the Python Dashboard Client](#14-run-the-python-dashboard-client)
-15. [Command Reference](#15-command-reference)
-16. [Security Architecture](#16-security-architecture)
-17. [Sensor Health Thresholds](#17-sensor-health-thresholds)
-18. [Sensor Specifications](#18-sensor-specifications)
-19. [Troubleshooting](#19-troubleshooting)
-20. [Project Architecture Deep-Dive](#20-project-architecture-deep-dive)
-21. [Future Roadmap](#21-future-roadmap)
+2. [Architecture Diagram](#2-architecture-diagram)
+3. [Repository Structure](#3-repository-structure)
+4. [Hardware Requirements and Wiring](#4-hardware-requirements-and-wiring)
+5. [Host Machine Prerequisites](#5-host-machine-prerequisites)
+6. [Linux-RT Kernel Setup](#6-linux-rt-kernel-setup)
+7. [Enable I2C and 1-Wire in Boot Config](#7-enable-i2c-and-1-wire-in-boot-config)
+8. [Clone the Repository and Generate Certificates](#8-clone-the-repository-and-generate-certificates)
+9. [Build the Project](#9-build-the-project)
+10. [Cross-Compile from x86-64](#10-cross-compile-from-x86-64)
+11. [Deploy to the Raspberry Pi](#11-deploy-to-the-raspberry-pi)
+12. [Run the Server](#12-run-the-server)
+13. [Run the Client](#13-run-the-client)
+14. [Command Reference](#14-command-reference)
+15. [Security Architecture](#15-security-architecture)
+16. [Sensor Specifications and Health Thresholds](#16-sensor-specifications-and-health-thresholds)
+17. [Benchmarks Overview](#17-benchmarks-overview)
+18. [Troubleshooting](#18-troubleshooting)
+19. [Quick Reference Card](#19-quick-reference-card)
 
 ---
 
@@ -39,1140 +38,978 @@
 
 ### What the system does
 
-```
-┌──────────────────────────────┐         ┌───────────────────────────────┐
-│   RASPBERRY PI 4  (Zephyr)   │         │   CLIENT MACHINE  (Linux/Mac) │
-│                              │  mTLS   │                               │
-│  GPIO 17 ← SW-420 Vibration  │◄───────►│  ./ims_client <RPi_IP>        │
-│  GPIO 27 ← LM393 Sound       │  TCP    │  python3 clients/dashboard.py │
-│  GPIO  4 ← DS18B20 Temp(1W)  │  8080   │                               │
-│  I2C1    ← ADS1115 (Current) │         └───────────────────────────────┘
-│                              │
-│  [1 kHz polling thread]      │
-│  [Zephyr TLS server :8080]   │
-└──────────────────────────────┘
-```
+Sentinel-RT turns a Raspberry Pi 4 into a secure, real-time edge monitoring node for industrial machinery. The Pi reads four sensor channels at different rates, evaluates equipment health, maintains a ring-buffer event log, and exposes all of this over an authenticated, encrypted TCP connection.
 
-The RPi 4 runs **Zephyr RTOS** as a bare-metal image (no Linux underneath). Zephyr boots directly from an SD card, initialises GPIO and I2C, starts a background 1 kHz sensor-polling thread, and then listens for TLS client connections on port 8080.
+| Capability | Detail |
+|---|---|
+| Real-time sensor polling | 1 kHz digital GPIO for vibration and sound; 1 Hz I2C for current; 1 Hz 1-Wire for temperature |
+| RT scheduling | `SCHED_FIFO` priority 80 sensor-polling thread; `mlockall(MCL_CURRENT | MCL_FUTURE)` eliminates page-fault latency |
+| Transport security | Mutual TLS 1.2 / 1.3 over TCP port 8080; OpenSSL on both server and client |
+| Access control | Four RBAC roles determined by the OU field of the client's X.509 certificate |
+| Event logging | In-memory ring buffer of up to 512 CRITICAL events; retrieved with `get_log` |
+| Live telemetry | Push-based `monitor [seconds]` command streams sensor readings at 1 s intervals |
+| Multi-client | Thread-per-client architecture — each accepted TLS connection runs in its own POSIX thread |
 
-### Key features
+### Why Linux PREEMPT_RT instead of a bare RTOS
 
-| Feature | Detail |
-|---------|--------|
-| Real-time sampling | 1 kHz digital GPIO polling; 1 Hz I2C and 1-Wire reads |
-| Security | Mutual TLS 1.2, MbedTLS, X.509 role certificates |
-| Access control | 4 roles: ADMIN, OPERATOR, MAINTENANCE, VIEWER |
-| Live telemetry | Push-based `monitor` command, 1 s update interval |
-| Black-box log | In-memory 4 KB ring buffer of CRITICAL events |
-| Multi-client | Up to 32 concurrent authenticated sessions |
-| Clients | C terminal client + Python Matplotlib dashboard |
+Linux with the PREEMPT_RT patch provides microsecond-class worst-case interrupt and scheduling latency on the RPi 4 while retaining the full Linux userspace: standard POSIX APIs, OpenSSL, sysfs GPIO, i2c-dev, and the w1_therm kernel driver. This makes the codebase vastly simpler than a bare-metal Zephyr image that would need custom MbedTLS integration, hand-written device-tree overlays, and a separate Linux build for the client side. The measured worst-case latency on RPi 4 with a stock PREEMPT_RT kernel is typically under 100 µs, which is more than adequate for 1 kHz sensor polling with deterministic jitter.
 
 ---
 
-## 2. Repository Structure
+## 2. Architecture Diagram
+
+```
+┌──────────────────────────────────────────────────────────┐
+│           RASPBERRY PI 4  (Linux PREEMPT_RT)             │
+│                                                          │
+│  ┌──────────────┐   sysfs   ┌────────────────────────┐  │
+│  │  SW-420      │──GPIO 17─►│                        │  │
+│  │  Vibration   │           │   sensor_manager.c     │  │
+│  ├──────────────┤   sysfs   │   (SCHED_FIFO prio 80) │  │
+│  │  KY-038      │──GPIO 27─►│   1 kHz poll loop      │  │
+│  │  Sound       │           │   health evaluation    │  │
+│  ├──────────────┤  w1_therm │   ring-buffer log      │  │
+│  │  DS18B20     │──GPIO  4─►│                        │  │
+│  │  Temperature │           └──────────┬─────────────┘  │
+│  ├──────────────┤   i2c-dev            │ SensorData      │
+│  │  ACS712+     │──I2C bus1────────────┘                 │
+│  │  ADS1115     │  (0x48)                                │
+│  │  Current     │                                        │
+│  └──────────────┘           ┌────────────────────────┐  │
+│                              │   server.c             │  │
+│                              │   OpenSSL mTLS :8080   │  │
+│                              │   thread-per-client    │  │
+│                              │   RBAC authorization   │  │
+│                              └───────────┬────────────┘  │
+└──────────────────────────────────────────┼───────────────┘
+                                           │ mTLS / TCP 8080
+           ┌───────────────────────────────┼──────────────┐
+           │      CLIENT MACHINE           │              │
+           │  (Linux / macOS / WSL)        ▼              │
+           │                                              │
+           │   $ ./ims_client <RPi_IP>                    │
+           │   ┌──────────────────────────────────────┐   │
+           │   │ ADMIN / OPERATOR / MAINTENANCE /     │   │
+           │   │ VIEWER  (role from cert OU field)    │   │
+           │   └──────────────────────────────────────┘   │
+           └──────────────────────────────────────────────┘
+```
+
+### Data flow summary
+
+1. The `sensor_manager` thread wakes every 1 ms (SCHED_FIFO, absolute `clock_nanosleep`).
+2. GPIO sysfs reads vibration and sound; i2c-dev reads ADS1115 raw ADC; w1_therm reads DS18B20.
+3. Readings are stored in a shared `SensorData` struct protected by a `pthread_mutex`.
+4. `server.c` accepts a TCP connection, performs an OpenSSL mTLS handshake, extracts the client OU to determine the RBAC role, then dispatches the session to a new thread.
+5. The session thread reads commands from the TLS stream and calls the appropriate handler in `protocol.c`.
+6. The client `ims_client` presents its role-specific certificate, sends commands typed by the operator, and prints the server responses.
+
+---
+
+## 3. Repository Structure
 
 ```
 Edge-Based-Industrial-Equipment-Health-Dashboard/
 │
-├── CMakeLists.txt              ← Zephyr build entry point
-├── prj.conf                    ← Zephyr Kconfig (TLS, networking, GPIO, I2C)
-├── Makefile                    ← Builds the Linux-side terminal client only
-│
-├── boards/
-│   └── rpi_4b.overlay          ← Device tree: enables I2C1, documents GPIO pins
+├── Makefile                    ← make server / make client / make certs / make all
 │
 ├── apps/
-│   ├── server.c                ← Zephyr TLS server (main entry point)
-│   └── client.c                ← Linux terminal client (OpenSSL mTLS)
-│
-├── clients/
-│   └── dashboard.py            ← Python real-time graphical dashboard
+│   ├── server.c                ← Linux-RT mTLS server (OpenSSL, SCHED_FIFO, thread-per-client)
+│   └── client.c                ← Linux terminal client (OpenSSL mTLS, interactive prompt)
 │
 ├── common/
-│   ├── authorization.h         ← Role definitions, authorize_client() prototype
-│   └── authorization.c         ← MbedTLS X.509 CN/OU extraction (Zephyr)
-│                                  OpenSSL X.509 extraction (Linux fallback)
+│   ├── authorization.h         ← Role enum, role_name(), authorize_client() prototype
+│   └── authorization.c         ← OpenSSL X.509 CN/OU extraction → RBAC role mapping
 │
 ├── drivers/
-│   ├── sensors.h               ← GPIO pin definitions, HAL prototypes
-│   ├── sensors.c               ← Zephyr GPIO/I2C/1-Wire HAL
-│   ├── sensor_manager.h        ← SensorManager struct, public API
-│   ├── sensor_manager.c        ← 1 kHz polling thread, health evaluation
-│   └── certs/
-│       └── certs.h             ← Auto-generated C arrays of server certs
+│   ├── sensors.h               ← GPIO pin macros, SensorReading struct, HAL prototypes
+│   ├── sensors.c               ← Linux sysfs GPIO + i2c-dev (ioctl) + w1_therm HAL
+│   ├── sensor_manager.h        ← SensorManager struct, start/stop API
+│   └── sensor_manager.c        ← SCHED_FIFO polling thread, health scoring, event log
 │
 ├── protocol/
-│   ├── protocol.h              ← ProtocolContext, command prototypes
-│   └── protocol.c              ← Command handlers, monitor loop, log ring buffer
+│   ├── protocol.h              ← ProtocolContext (SSL* + role), command handler prototypes
+│   └── protocol.c              ← handle_command(), monitor loop, log ring buffer helpers
 │
 ├── scripts/
-│   ├── quick_start.sh          ← One-command: cert gen + client build + Zephyr build
-│   └── gen_cert_headers.sh     ← Converts PEM certs → C arrays in drivers/certs/certs.h
+│   └── quick_start.sh          ← Cert generation (openssl CLI) + build + optional deploy
 │
-├── tests/
-│   └── sensor_test.c           ← Standalone hardware diagnostic tool
+├── certs/                      ← Generated by quick_start.sh (gitignored)
+│   ├── ca.crt / ca.key
+│   ├── server.crt / server.key
+│   ├── admin_client.crt / admin_client.key
+│   ├── operator_client.crt / operator_client.key
+│   ├── maintenance_client.crt / maintenance_client.key
+│   ├── viewer_client.crt / viewer_client.key
+│   └── client.crt / client.key ← Symlink → admin_client (default for ims_client)
 │
-├── config/
-│   └── client_roles.conf       ← Reference: CN → role mappings
-│
-└── certs/                      ← Generated at runtime (gitignored)
-    ├── ca.crt / ca.key
-    ├── server.crt / server.key
-    ├── admin_client.crt/key
-    ├── operator_client.crt/key
-    ├── viewer_client.crt/key
-    ├── maintenance_client.crt/key
-    └── client.crt/key          ← Symlink to admin_client (default)
+└── tests/
+    ├── bench_sha_qnx.c               ← SHA-256 benchmark for QNX Neutrino
+    ├── bench_sha_linuxrt.c           ← SHA-256 benchmark for Linux-RT
+    ├── bench_matrix1_qnx.c           ← Matrix multiply benchmark for QNX
+    ├── bench_matrix1_linuxrt.c       ← Matrix multiply benchmark for Linux-RT
+    ├── bench_md5_qnx.c               ← MD5 benchmark for QNX
+    ├── bench_md5_linuxrt.c           ← MD5 benchmark for Linux-RT
+    ├── bench_binarysearch_qnx.c      ← Binary search benchmark for QNX
+    ├── bench_binarysearch_linuxrt.c  ← Binary search benchmark for Linux-RT
+    ├── bench_fir2dim_qnx.c           ← 2-D FIR filter benchmark for QNX
+    └── bench_fir2dim_linuxrt.c       ← 2-D FIR filter benchmark for Linux-RT
 ```
 
 ---
 
-## 3. Hardware Setup
+## 4. Hardware Requirements and Wiring
 
 ### Bill of Materials
 
-| # | Component | Model | Purpose |
-|---|-----------|-------|---------|
-| 1 | SBC | Raspberry Pi 4 Model B (any RAM) | Host for Zephyr RTOS |
-| 2 | Vibration sensor | SW-420 | Detects mechanical shock/vibration |
-| 3 | Sound sensor | LM393 microphone module | Measures acoustic duty cycle |
-| 4 | Temperature sensor | DS18B20 (TO-92 or waterproof) | 1-Wire digital temperature |
-| 5 | Current sensor | ACS712 (±20 A variant) | Hall-effect current sensing |
-| 6 | ADC | ADS1115 (16-bit I2C) | Converts ACS712 analogue output |
-| 7 | Resistor | 4.7 kΩ | DS18B20 1-Wire pull-up |
-| 8 | LED (optional) | Any 3.3 V LED + 330 Ω resistor | Status indicator |
-| 9 | Micro-SD card | ≥ 4 GB, Class 10 | Boots Zephyr image |
-| 10 | USB-UART adapter | CP2102 / CH340 / FTDI | Monitor serial console |
+| # | Component | Model / Part | Purpose |
+|---|---|---|---|
+| 1 | Single-board computer | Raspberry Pi 4 Model B (1/2/4/8 GB) | Runs Linux-RT server |
+| 2 | Vibration sensor | SW-420 normally-closed module | Detects mechanical shock |
+| 3 | Sound sensor | KY-038 microphone comparator module | Acoustic duty-cycle monitoring |
+| 4 | Temperature sensor | DS18B20 (TO-92 or waterproof probe) | 1-Wire digital temperature |
+| 5 | Current sensor | ACS712-20A Hall-effect module | Measures motor/load current |
+| 6 | ADC | ADS1115 16-bit I2C ADC breakout (0x48) | Digitises ACS712 analogue output |
+| 7 | Pull-up resistor | 4.7 kΩ through-hole resistor | DS18B20 1-Wire line pull-up |
+| 8 | Micro-SD card | 8 GB+, Class 10 or better | Operating system + application |
+| 9 | Power supply | Official RPi 4 USB-C 5V/3A | Stable power under I2C load |
+| 10 | Jumper wires | Male-to-female and male-to-male | Breadboard connections |
 
-### RPi 4 GPIO Pinout Reference
-
-```
-                    3V3  (1) (2)  5V
-   SDA1 / GPIO  2   (3) (4)  5V
-   SCL1 / GPIO  3   (5) (6)  GND
-  1-Wire / GPIO  4  (7) (8)  GPIO 14  ← UART TX (console out)
-              GND  (9) (10)  GPIO 15  ← UART RX (console in)
-    Vib / GPIO 17  (11) (12)  GPIO 18
-    Snd / GPIO 27  (13) (14)  GND
-    LED / GPIO 22  (15) (16)  GPIO 23
-              3V3 (17) (18)  GPIO 24
-             ...
-```
-
-### Wiring Diagram
-
-#### SW-420 Vibration Sensor
-
-| SW-420 Pin | RPi Physical Pin | Note |
-|-----------|-----------------|------|
-| VCC | Pin 1 (3.3 V) | |
-| GND | Pin 6 (GND) | |
-| DO | Pin 11 (GPIO 17) | Digital output |
-
-#### LM393 Sound Sensor Module
-
-| LM393 Pin | RPi Physical Pin | Note |
-|-----------|-----------------|------|
-| VCC | Pin 1 (3.3 V) | |
-| GND | Pin 6 (GND) | |
-| DO | Pin 13 (GPIO 27) | Digital output — adjust onboard pot until LED triggers only on loud sounds |
-
-#### DS18B20 Temperature Sensor
-
-| DS18B20 Pin | RPi Physical Pin | Note |
-|-------------|-----------------|------|
-| VDD | Pin 1 (3.3 V) | Normal power mode |
-| GND | Pin 6 (GND) | |
-| DATA | Pin 7 (GPIO 4) | **MUST add 4.7 kΩ pull-up between VDD and DATA** |
+### RPi 4 GPIO Header Reference (selected pins)
 
 ```
-  3.3V ──┬──[4.7kΩ]──┬── GPIO 4
-         │           │
-        VDD         DATA
-        GND ─────── GND
+         3V3  (1) (2)  5V
+ SDA1/GPIO 2  (3) (4)  5V
+ SCL1/GPIO 3  (5) (6)  GND
+ 1Wire/GPIO 4 (7) (8)  GPIO14 (UART TX)
+          GND (9) (10) GPIO15 (UART RX)
+  Vib/GPIO17 (11) (12) GPIO18
+  Snd/GPIO27 (13) (14) GND
+         3V3 (17) (18) GPIO24
+         GND (25) (26) GPIO7
 ```
 
-#### ADS1115 ADC (I2C)
+### Wiring Tables
 
-| ADS1115 Pin | RPi Physical Pin | Note |
-|-------------|-----------------|------|
-| VDD | Pin 1 (3.3 V) | |
-| GND | Pin 6 (GND) | |
-| SDA | Pin 3 (GPIO 2) | I2C1 data |
-| SCL | Pin 5 (GPIO 3) | I2C1 clock |
-| ADDR | GND | Sets I2C address to 0x48 |
-| A0 | ACS712 OUT | Analogue input channel 0 |
+#### SW-420 Vibration Sensor → RPi 4
 
-#### ACS712 Current Sensor
+| SW-420 Pin | RPi 4 Physical Pin | BCM GPIO | Note |
+|---|---|---|---|
+| VCC | Pin 1 | 3.3 V | Module rated 3.3–5 V |
+| GND | Pin 6 | GND | |
+| DO | Pin 11 | GPIO 17 | Digital output, active LOW on vibration |
 
-| ACS712 Pin | Connection | Note |
-|-----------|-----------|------|
-| VCC | RPi Pin 2 (5 V) | Requires 5 V supply |
-| GND | RPi Pin 6 (GND) | |
-| OUT | ADS1115 A0 | 0–5 V analogue (2.5 V = 0 A) |
-| IP+ / IP- | In series with monitored load | Break the circuit being measured |
+#### KY-038 Sound Sensor → RPi 4
 
-#### USB-UART Adapter (Serial Console)
+| KY-038 Pin | RPi 4 Physical Pin | BCM GPIO | Note |
+|---|---|---|---|
+| VCC | Pin 1 | 3.3 V | |
+| GND | Pin 6 | GND | |
+| DO | Pin 13 | GPIO 27 | Adjust the blue trimmer pot so DO goes HIGH only on loud noise |
 
-| UART Adapter | RPi Physical Pin | Note |
-|-------------|-----------------|------|
-| GND | Pin 6 (GND) | Common ground |
-| RX | Pin 8 (GPIO 14) | RPi TX → Adapter RX |
-| TX | Pin 10 (GPIO 15) | RPi RX ← Adapter TX |
-| 3.3 V | **Do NOT connect** | RPi is self-powered |
+The KY-038 has both a digital output (DO, comparator-based) and an analogue output (AO). Sentinel-RT uses only the digital output (DO).
 
-> **Baud rate:** 115200 8N1
+#### DS18B20 Temperature Sensor → RPi 4
+
+| DS18B20 Pin | RPi 4 Physical Pin | BCM GPIO | Note |
+|---|---|---|---|
+| VDD | Pin 1 | 3.3 V | Use normal power mode (not parasite) |
+| GND | Pin 9 | GND | |
+| DATA | Pin 7 | GPIO 4 | **4.7 kΩ pull-up mandatory between VDD and DATA** |
+
+```
+  3.3V ──┬──[4.7 kΩ]──┬── GPIO 4
+         │             │
+        VDD           DATA    (DS18B20)
+        GND ───────── GND
+```
+
+#### ACS712 Current Sensor → ADS1115 ADC → RPi 4
+
+| Connection | Detail |
+|---|---|
+| ACS712 VCC | 5 V (RPi Pin 2) |
+| ACS712 GND | GND (RPi Pin 6) |
+| ACS712 OUT | ADS1115 A0 (analogue input) |
+| ADS1115 VDD | 3.3 V (RPi Pin 1) |
+| ADS1115 GND | GND (RPi Pin 6) |
+| ADS1115 SDA | GPIO 2 / SDA1 (RPi Pin 3) |
+| ADS1115 SCL | GPIO 3 / SCL1 (RPi Pin 5) |
+| ADS1115 ADDR | GND → I2C address 0x48 |
+
+The ACS712-20A outputs 2.5 V at 0 A with a sensitivity of 100 mV/A. The ADS1115 is configured for ±4.096 V full-scale range in single-ended mode on AIN0. The driver converts the raw 16-bit ADC value to amps using: `current_A = (adc_raw * 4.096 / 32768.0 - 2.5) / 0.1`.
 
 ---
 
-## 4. Host Machine Prerequisites
+## 5. Host Machine Prerequisites
 
-Everything below runs on a **Linux workstation** (Ubuntu 22.04 / Debian 12 recommended). WSL2 on Windows also works. macOS works with Homebrew equivalents.
+All prerequisites must be installed on the **Raspberry Pi 4** itself (the build and runtime machine). If you are cross-compiling from an x86-64 host, see Section 10.
+
+### Install required packages on the RPi (Raspberry Pi OS Bookworm / Debian 12)
 
 ```bash
-# Core build tools
+sudo apt update && sudo apt upgrade -y
+
+# Compiler and build tools
+sudo apt install -y gcc make
+
+# OpenSSL development library (required for both server and client builds)
+sudo apt install -y libssl-dev openssl
+
+# I2C userspace tools (for i2cdetect, i2cget — useful for debugging)
+sudo apt install -y i2c-tools
+
+# 1-Wire tools (optional but useful for diagnosing DS18B20)
+sudo apt install -y python3-w1thermsensor
+
+# Git (to clone the repository)
+sudo apt install -y git
+```
+
+### Verify OpenSSL
+
+```bash
+openssl version
+# Expected: OpenSSL 3.x.x  (Bookworm ships 3.0)
+```
+
+### Verify I2C tools
+
+```bash
+sudo i2cdetect -y 1
+# You should see 0x48 in the grid if the ADS1115 is wired correctly
+```
+
+---
+
+## 6. Linux-RT Kernel Setup
+
+The PREEMPT_RT patch transforms the Linux kernel's interrupt handlers and spinlocks into preemptible threads, reducing worst-case scheduling latency from tens of milliseconds (vanilla Linux) to tens of microseconds. This is essential for the 1 kHz sensor polling thread in Sentinel-RT to meet its timing budget.
+
+### Option A — Install the pre-built RT kernel (recommended for most users)
+
+Raspberry Pi OS Bookworm provides a pre-built PREEMPT_RT kernel in its repositories. This is the easiest path:
+
+```bash
 sudo apt update
-sudo apt install -y \
-    git cmake ninja-build gperf \
-    ccache dfu-util device-tree-compiler wget \
-    python3-dev python3-pip python3-setuptools python3-tk python3-wheel \
-    xz-utils file make gcc gcc-multilib g++-multilib \
-    libsdl2-dev libmagic1 \
-    openssl libssl-dev \
-    minicom picocom        # for UART console monitoring
 
-# Python packages
-pip3 install --user west matplotlib numpy
+# Install the RT kernel image and headers
+sudo apt install -y linux-image-rt-arm64 linux-headers-rt-arm64
+
+# Reboot into the RT kernel
+sudo reboot
 ```
 
-Verify that `west` is on your PATH:
+After reboot, verify:
 
 ```bash
-west --version
-# Expected: west, version 1.x.x
+uname -a
+# Should contain "PREEMPT_RT" in the output, e.g.:
+# Linux raspberrypi 6.6.x-rt-v8+ #1 SMP PREEMPT_RT ...
+
+cat /sys/kernel/realtime
+# Should print: 1
 ```
 
----
-
-## 5. Install the Zephyr SDK
-
-The Zephyr SDK provides the `aarch64-zephyr-elf` cross-compiler needed to build for the RPi 4.
-
-### Step 1 — Download the SDK bundle
-
-Go to the [Zephyr SDK releases page](https://github.com/zephyrproject-rtos/sdk-ng/releases) and download the latest minimal bundle for your host architecture. For a 64-bit Linux host:
+If `linux-image-rt-arm64` is not found, try the Raspberry Pi Foundation's own RT kernel:
 
 ```bash
-cd ~
-wget https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.16.8/zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz
-wget https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.16.8/sha256.sum
-sha256sum --check --ignore-missing sha256.sum
+sudo apt install -y raspberrypi-kernel-rt
+sudo reboot
 ```
 
-> Replace `v0.16.8` with whatever is the latest stable release.
+### Option B — Build PREEMPT_RT from source
 
-### Step 2 — Extract and install
+Use this path if you need a custom kernel configuration or a specific RT patch version.
+
+**Step 1 — Install build dependencies (on the RPi or a cross-compile host):**
 
 ```bash
-tar -xvf zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz
-cd zephyr-sdk-0.16.8
-
-# Install the SDK (sets up udev rules and CMake packages)
-./setup.sh -t aarch64-zephyr-elf -h -c
+sudo apt install -y bc bison flex libssl-dev make gcc \
+    libncurses-dev git wget xz-utils
 ```
 
-The `-t aarch64-zephyr-elf` flag installs only the ARM 64-bit toolchain (needed for RPi 4). This is significantly faster than installing all toolchains.
-
-### Step 3 — Set environment variable
+**Step 2 — Download the kernel source and matching RT patch:**
 
 ```bash
-# Add to ~/.bashrc (or ~/.zshrc) so it persists across sessions
-echo 'export ZEPHYR_SDK_INSTALL_DIR=~/zephyr-sdk-0.16.8' >> ~/.bashrc
-source ~/.bashrc
+# Find a matching RT patch at https://cdn.kernel.org/pub/linux/kernel/projects/rt/
+# Example for kernel 6.6.x:
+KERNEL_VERSION=6.6.31
+RT_PATCH=patch-6.6.31-rt31.patch.xz
+
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz
+wget https://cdn.kernel.org/pub/linux/kernel/projects/rt/6.6/${RT_PATCH}
+
+tar xf linux-${KERNEL_VERSION}.tar.xz
+cd linux-${KERNEL_VERSION}
+xzcat ../${RT_PATCH} | patch -p1
 ```
 
-### Step 4 — Verify the toolchain
+**Step 3 — Configure with PREEMPT_RT enabled:**
 
 ```bash
-aarch64-zephyr-elf-gcc --version
-# Expected: aarch64-zephyr-elf-gcc (Zephyr SDK ...) 12.x.x
+# Start from the RPi default config
+make bcm2711_defconfig
+
+# Open menuconfig and set: General setup → Preemption Model → Fully Preemptible Kernel (Real-Time)
+make menuconfig
+
+# Or set it non-interactively:
+scripts/config --enable PREEMPT_RT
+scripts/config --disable PREEMPT_VOLUNTARY
+scripts/config --disable PREEMPT
 ```
 
----
-
-## 6. Set Up a West Workspace
-
-Zephyr uses **west** as its meta-tool for managing the repository and its many dependencies. You initialise a workspace once per machine.
-
-### Step 1 — Create a workspace directory
+**Step 4 — Build and install:**
 
 ```bash
-mkdir ~/zephyrproject
-cd ~/zephyrproject
+# On the RPi (slow — allow 2+ hours):
+make -j4 Image.gz modules dtbs
+sudo make modules_install
+sudo cp arch/arm64/boot/Image.gz /boot/kernel8.img
+sudo cp arch/arm64/boot/dts/broadcom/bcm2711-rpi-4-b.dtb /boot/
+sudo reboot
 ```
 
-### Step 2 — Initialise the workspace
+**Step 5 — Verify (same as Option A):**
 
 ```bash
-west init .
-# This downloads the Zephyr manifest and creates the .west/ folder
+uname -a          # Must contain PREEMPT_RT
+cat /sys/kernel/realtime   # Must print 1
 ```
 
-### Step 3 — Pull all dependencies
+### Set RT scheduling permissions for non-root users (optional)
+
+By default, only root can set `SCHED_FIFO`. The server runs as root, so this is not required. If you want to test benchmarks as a normal user:
 
 ```bash
-west update
-# Downloads Zephyr kernel, HAL for BCM2711, MbedTLS, etc.
-# This can take 5–15 minutes on first run.
-```
-
-### Step 4 — Set up Python requirements
-
-```bash
-pip3 install --user -r ~/zephyrproject/zephyr/scripts/requirements.txt
-```
-
-### Step 5 — Export CMake packages
-
-```bash
-west zephyr-export
-```
-
-### Step 6 — Verify the environment
-
-```bash
-cd ~/zephyrproject/zephyr
-west build -b rpi_4b samples/hello_world
-# Should complete without errors and produce build/zephyr/zephyr.bin
-```
-
-If the hello world builds successfully, your environment is ready.
-
-### Step 7 — Link this project into the workspace
-
-Place the cloned project **inside** the west workspace so west can find it:
-
-```bash
-# Option A: Clone directly into the workspace
-cd ~/zephyrproject
-git clone https://github.com/Hemanthkumar04/Edge-Based-Industrial-Equipment-Health-Dashboard.git sentinel_rt
-cd sentinel_rt
-
-# Option B: Symlink an existing clone
-ln -s /path/to/your/clone ~/zephyrproject/sentinel_rt
-cd ~/zephyrproject/sentinel_rt
-```
-
-> `ZEPHYR_BASE` must point to the Zephyr kernel source. West sets this automatically when you run `west build` from inside a workspace. If you build outside the workspace, set it manually:
-> ```bash
-> export ZEPHYR_BASE=~/zephyrproject/zephyr
-> ```
-
----
-
-## 7. Generate TLS Certificates
-
-All TLS certificates are generated on your host machine using OpenSSL. This creates:
-
-- A private Certificate Authority (CA)
-- A server certificate (loaded into the Zephyr firmware as C arrays)
-- Four client certificates (one per role: admin, operator, viewer, maintenance)
-
-Run the generation script:
-
-```bash
-cd ~/zephyrproject/sentinel_rt
-./scripts/quick_start.sh certs
-```
-
-What this does internally:
-
-```
-certs/
-├── ca.key          ← CA private key  (KEEP SECRET)
-├── ca.crt          ← CA certificate  (shared with all clients)
-├── server.key      ← Server private key  (embedded in firmware)
-├── server.crt      ← Server certificate
-├── admin_client.key/crt      ← ADMIN role
-├── operator_client.key/crt   ← OPERATOR role
-├── viewer_client.key/crt     ← VIEWER role
-├── maintenance_client.key/crt ← MAINTENANCE role
-├── client.key      ← Default client key (copy of admin_client.key)
-└── client.crt      ← Default client cert (copy of admin_client.crt)
-```
-
-> **Security note:** The `certs/` directory is in `.gitignore`. Never commit private keys to git. Each team member should generate their own certificates or share them out-of-band.
-
-### Distributing client certificates to teammates
-
-```bash
-# For each teammate, give them their role-appropriate cert + the CA cert:
-scp certs/operator_client.crt certs/operator_client.key certs/ca.crt teammate@machine:~/sentinel_rt/certs/
-
-# They rename to the default paths:
-cp certs/operator_client.crt certs/client.crt
-cp certs/operator_client.key certs/client.key
-```
-
----
-
-## 8. Embed Certificates into the Firmware
-
-Because Zephyr runs bare-metal (no filesystem), TLS certificates cannot be loaded from files at runtime. Instead they are compiled into the firmware as C byte arrays.
-
-Run the header generator:
-
-```bash
-./scripts/gen_cert_headers.sh
-```
-
-This reads `certs/ca.crt`, `certs/server.crt`, `certs/server.key`, converts them to DER format, and writes them into `drivers/certs/certs.h` as `static const unsigned char[]` arrays.
-
-You can verify the output:
-
-```bash
-head -30 drivers/certs/certs.h
-# Should show: static const unsigned char ca_cert_der[] = { 0x30, 0x82, ...
-```
-
-> **Important:** You must re-run `gen_cert_headers.sh` every time you regenerate certificates, then rebuild the Zephyr image.
-
----
-
-## 9. Build the Zephyr Server Image
-
-From the project root (inside your west workspace):
-
-```bash
-west build -b rpi_4b .
-```
-
-### What this does
-
-1. CMake reads `CMakeLists.txt` and `prj.conf`
-2. Zephyr's build system compiles the kernel + all enabled drivers (networking, TLS, GPIO, I2C)
-3. Your application sources are compiled and linked against the Zephyr kernel
-4. The output is a single binary: `build/zephyr/zephyr.bin`
-
-### Expected output
-
-```
--- west build: generating a build system
-...
-[  1/342] Preparing syscall dependency handling
-...
-[342/342] Linking C executable zephyr/zephyr.elf
-Memory region         Used Size  Region Size  %age Used
-           FLASH:      412672 B         1 MB     39.36%
-            SRAM:       65536 B       128 MB      0.05%
-        IDT_LIST:          0 GB        32 KB      0.00%
-```
-
-### Useful build variants
-
-```bash
-# Clean rebuild
-west build -b rpi_4b . --pristine
-
-# Open interactive configuration menu
-west build -b rpi_4b . -t menuconfig
-
-# Verbose build output (useful for debugging compile errors)
-west build -b rpi_4b . -- -DCMAKE_VERBOSE_MAKEFILE=ON
-```
-
----
-
-## 10. Prepare the SD Card
-
-Zephyr boots from a FAT32 micro-SD card on the RPi 4. The boot process is:
-
-```
-Power ON → GPU reads SD card → loads start4.elf → reads config.txt
-        → loads zephyr.bin → Zephyr kernel starts
-```
-
-### Step 1 — Format the SD card
-
-The SD card needs:
-- **Partition table:** MBR (not GPT)
-- **Partition 1:** FAT32, at least 64 MB, bootable flag set
-
-On Linux (replace `/dev/sdX` with your actual SD card device — verify with `lsblk`):
-
-```bash
-# WARNING: This ERASES the card. Double-check /dev/sdX is your SD card.
-sudo fdisk /dev/sdX <<EOF
-o       # Create new MBR partition table
-n       # New partition
-p       # Primary
-1       # Partition number 1
-        # Default first sector
-+256M   # 256 MB FAT32 partition
-t       # Change type
-b       # FAT32
-a       # Toggle bootable flag
-w       # Write and exit
-EOF
-
-sudo mkfs.vfat -F 32 -n BOOT /dev/sdX1
-```
-
-Alternatively, use **GParted** (GUI) or **Raspberry Pi Imager** to format (choose "Erase" option to get a clean FAT32 card).
-
-### Step 2 — Mount the SD card
-
-```bash
-sudo mkdir -p /mnt/sdcard
-sudo mount /dev/sdX1 /mnt/sdcard
-```
-
-### Step 3 — Download RPi 4 firmware files
-
-These files are the GPU bootloader blobs provided by the Raspberry Pi Foundation. Zephyr requires them.
-
-```bash
-cd /mnt/sdcard
-
-# GPU firmware
-wget https://raw.githubusercontent.com/raspberrypi/firmware/master/boot/start4.elf
-wget https://raw.githubusercontent.com/raspberrypi/firmware/master/boot/fixup4.dat
-
-# Device tree blob for BCM2711 (RPi 4)
-wget https://raw.githubusercontent.com/raspberrypi/firmware/master/boot/bcm2711-rpi-4-b.dtb
-```
-
-### Step 4 — Copy the Zephyr binary
-
-```bash
-cp ~/zephyrproject/sentinel_rt/build/zephyr/zephyr.bin /mnt/sdcard/
-```
-
-### Step 5 — Create `config.txt`
-
-Create the file `/mnt/sdcard/config.txt` with exactly this content:
-
-```bash
-cat > /mnt/sdcard/config.txt << 'EOF'
-kernel=zephyr.bin
-arm_64bit=1
-enable_uart=1
-uart_2ndstage=1
+# Add to /etc/security/limits.conf:
+sudo tee -a /etc/security/limits.conf <<'EOF'
+*  hard  rtprio  99
+*  soft  rtprio  99
 EOF
 ```
 
-| Option | Effect |
-|--------|--------|
-| `kernel=zephyr.bin` | Tells the GPU bootloader to load and execute `zephyr.bin` |
-| `arm_64bit=1` | Boot in 64-bit AArch64 mode (required for Zephyr on RPi 4) |
-| `enable_uart=1` | Enables the mini UART / PL011 for serial console |
-| `uart_2ndstage=1` | Keeps UART enabled during the GPU second-stage boot |
+---
 
-### Step 6 — Unmount
+## 7. Enable I2C and 1-Wire in Boot Config
+
+Edit `/boot/config.txt` (or `/boot/firmware/config.txt` on newer Raspberry Pi OS images):
 
 ```bash
-sync
-sudo umount /mnt/sdcard
+sudo nano /boot/config.txt
 ```
 
-Your SD card is ready. The final card contents should look like:
+Add or uncomment these lines:
 
+```ini
+# Enable I2C bus 1 (GPIO 2 = SDA, GPIO 3 = SCL)
+dtparam=i2c_arm=on
+dtparam=i2c_arm_baudrate=400000
+
+# Enable 1-Wire on GPIO 4 (DS18B20)
+dtoverlay=w1-gpio,gpiopin=4
+
+# Optional: ensure SPI is off to reduce IRQ noise during benchmarks
+dtparam=spi=off
 ```
-/
-├── bcm2711-rpi-4-b.dtb
-├── start4.elf
-├── fixup4.dat
-├── zephyr.bin
-└── config.txt
+
+Save the file and reboot:
+
+```bash
+sudo reboot
+```
+
+After reboot, verify:
+
+```bash
+# I2C — should show /dev/i2c-1
+ls /dev/i2c-*
+
+# 1-Wire — should show a directory named 28-xxxxxxxxxxxx
+ls /sys/bus/w1/devices/
+
+# Read the temperature directly
+cat /sys/bus/w1/devices/28-*/w1_slave
+# Output looks like:
+# 50 05 55 05 7f ff 0c 10 1c : crc=1c YES
+# 50 05 55 05 7f ff 0c 10 1c t=21312
+# The t= value is temperature in millidegrees Celsius (21.312 °C)
 ```
 
 ---
 
-## 11. Flash / Deploy Zephyr to the Raspberry Pi 4
-
-1. Insert the prepared micro-SD card into the RPi 4's SD card slot.
-2. Connect your USB-UART adapter to GPIO 14 (TX) and GPIO 15 (RX) as described in [Section 3](#3-hardware-setup).
-3. Connect your USB-UART adapter to your host machine.
-4. **Do not power on yet** — open the serial monitor first (next section).
-5. Connect the RPi 4 power supply (5 V / 3 A via USB-C).
-
-That's the entire "flashing" process for Zephyr on RPi 4. There is no `west flash` command — you physically swap the SD card. For iterative development, keep the SD card mounted and overwrite `zephyr.bin`:
+## 8. Clone the Repository and Generate Certificates
 
 ```bash
-# Quick redeploy after rebuild:
-sudo mount /dev/sdX1 /mnt/sdcard
-cp build/zephyr/zephyr.bin /mnt/sdcard/
-sync && sudo umount /mnt/sdcard
+# Clone the repository
+git clone https://github.com/Hemanthkumar04/Edge-Based-Industrial-Equipment-Health-Dashboard.git
+cd Edge-Based-Industrial-Equipment-Health-Dashboard
+
+# Make the helper script executable
+chmod +x scripts/quick_start.sh
+
+# Generate all TLS certificates (CA, server, and four role-based client certs)
+./scripts/quick_start.sh
+```
+
+The `quick_start.sh` script performs the following steps using the `openssl` CLI:
+
+1. Creates a self-signed Certificate Authority (`certs/ca.crt` + `certs/ca.key`)
+2. Generates the server certificate signed by the CA (`certs/server.crt` + `certs/server.key`)
+3. Generates four client certificates, one per RBAC role, each with a distinct OU field:
+   - `OU=ADMIN` → `certs/admin_client.crt / admin_client.key`
+   - `OU=OPERATOR` → `certs/operator_client.crt / operator_client.key`
+   - `OU=MAINTENANCE` → `certs/maintenance_client.crt / maintenance_client.key`
+   - `OU=VIEWER` → `certs/viewer_client.crt / viewer_client.key`
+4. Creates a symlink `certs/client.crt` → `certs/admin_client.crt` (default identity for `ims_client`)
+
+> **Security note:** The `certs/` directory is listed in `.gitignore`. Never commit private keys to version control.
+
+---
+
+## 9. Build the Project
+
+### Build both server and client
+
+```bash
+make
+# Equivalent to: make server && make client
+```
+
+### Build only the server
+
+```bash
+make server
+# Produces: ./ims_server
+# Compiler flags: gcc -O2 -Wall -Wextra -lpthread -lssl -lcrypto
+```
+
+### Build only the client
+
+```bash
+make client
+# Produces: ./ims_client
+# Compiler flags: gcc -O2 -Wall -Wextra -lssl -lcrypto
+```
+
+### Generate certificates via Make
+
+```bash
+make certs
+# Runs scripts/quick_start.sh internally
+```
+
+### Clean build artifacts
+
+```bash
+make clean
+```
+
+### Expected output after `make`
+
+```
+gcc -O2 -Wall -Wextra -Icommon -Idrivers -Iprotocol \
+    apps/server.c common/authorization.c drivers/sensors.c \
+    drivers/sensor_manager.c protocol/protocol.c \
+    -o ims_server -lpthread -lssl -lcrypto
+gcc -O2 -Wall -Wextra -Icommon \
+    apps/client.c common/authorization.c \
+    -o ims_client -lssl -lcrypto
 ```
 
 ---
 
-## 12. Monitor the Boot Console (UART)
+## 10. Cross-Compile from x86-64
 
-The Zephyr kernel prints all `printf` / `printk` output to UART0 (GPIO 14/15). Connect your USB-UART adapter and use one of the following tools.
+If you prefer to build on a faster x86-64 workstation and copy the binaries to the RPi:
 
-### Using minicom
-
-```bash
-sudo minicom -D /dev/ttyUSB0 -b 115200
-# Exit with: Ctrl+A then X
-```
-
-### Using picocom
+### Install the cross-compiler
 
 ```bash
-picocom -b 115200 /dev/ttyUSB0
-# Exit with: Ctrl+A then Ctrl+X
+# Ubuntu/Debian x86-64 host
+sudo apt install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+# Install OpenSSL for AArch64 (sysroot approach)
+# Easiest: use a Docker container with arm64 Debian, or install multiarch libs
+sudo dpkg --add-architecture arm64
+sudo apt update
+sudo apt install -y libssl-dev:arm64
 ```
 
-### Using screen
+### Cross-compile
 
 ```bash
-screen /dev/ttyUSB0 115200
-# Exit with: Ctrl+A then K then Y
+CC=aarch64-linux-gnu-gcc make
+# or, if your OpenSSL arm64 headers are in a custom sysroot:
+CC=aarch64-linux-gnu-gcc \
+  CFLAGS="--sysroot=/usr/aarch64-linux-gnu" \
+  LDFLAGS="--sysroot=/usr/aarch64-linux-gnu" \
+  make
 ```
 
-> If your USB-UART adapter shows up as `/dev/ttyACM0` instead of `/dev/ttyUSB0`, adjust accordingly. Run `ls /dev/tty*` before and after plugging in to identify the correct device.
+### Copy to the RPi
 
-### Expected boot output
-
-```
-*** Booting Zephyr OS build v3.x.x-xxx ***
-====================================================
-   Sentinel-RT Monitoring System (Zephyr / RPi 4)
-====================================================
-[HW] GPIO and I2C initialized (Vib:GPIO17, Snd:GPIO27, 1W:GPIO4)
-[SENSORS] Background polling thread started.
-[TLS] Credentials loaded (CA=1, CERT=2, KEY=3)
-[NETWORK] Listening on port 8080 (mTLS)
-
-[NETWORK] Waiting for connection...
-```
-
-If you see the `[NETWORK] Listening on port 8080` line, the server is fully up. If anything before it fails, see [Section 19 — Troubleshooting](#19-troubleshooting).
-
-### Finding the RPi 4's IP address
-
-Zephyr obtains an IP via DHCP. Two ways to find it:
-
-**From the UART console:** Add a short delay after DHCP and print the IP (requires customisation — see [Troubleshooting](#finding-the-rpi-4-ip-address)).
-
-**From your router:** Check your router's DHCP client list. The RPi 4 will appear as a device with hostname `zephyr` or the MAC address of the RPi 4.
-
-**Using nmap on your network:**
 ```bash
-nmap -sn 192.168.1.0/24 | grep -A2 "Raspberry\|zephyr"
+scp ims_server ims_client pi@<RPi_IP>:~/sentinel-rt/
 ```
 
 ---
 
-## 13. Build the Linux Terminal Client
+## 11. Deploy to the Raspberry Pi
 
-The terminal client (`ims_client`) runs on your Linux workstation and connects to the Zephyr server over mTLS.
-
-```bash
-cd ~/zephyrproject/sentinel_rt
-make client_linux
-```
-
-Expected output:
-```
-[INFO] Building Linux Client...
-gcc -D_GNU_SOURCE -Wall -Wextra ... -o ims_client apps/client.c -lssl -lcrypto -lpthread
-[OK] ims_client built.
-```
-
-### Connect to the server
+The `quick_start.sh` script has an optional `deploy` subcommand that copies all necessary files (binaries, certificates, and a systemd unit) to the RPi over SSH:
 
 ```bash
-./ims_client <RPi4_IP_ADDRESS>
+./scripts/quick_start.sh deploy <RPi_IP>
+# Example:
+./scripts/quick_start.sh deploy 192.168.1.42
 ```
 
-Example:
-```
-[INFO] Connecting securely to 192.168.1.42:8080...
+This command performs:
+1. `scp ims_server ims_client pi@<IP>:~/sentinel-rt/`
+2. `scp -r certs/ pi@<IP>:~/sentinel-rt/certs/`
+3. Optionally installs a systemd service so `ims_server` starts on boot
 
-✓ Connected securely to server.
-Type 'help' for available commands:
-
---- Connected to Sentinel-RT Secure Server ---
-IMS>
-```
-
-The client uses the certificates in `certs/client.crt` and `certs/client.key` (which default to the admin role). To connect with a different role:
+### Manual deployment
 
 ```bash
-# Temporarily use the viewer certificate
-cp certs/viewer_client.crt certs/client.crt
-cp certs/viewer_client.key certs/client.key
+RPi_IP=192.168.1.42
+
+# Create the target directory
+ssh pi@${RPi_IP} "mkdir -p ~/sentinel-rt/certs"
+
+# Copy binaries
+scp ims_server ims_client pi@${RPi_IP}:~/sentinel-rt/
+
+# Copy certificates
+scp certs/ca.crt certs/server.crt certs/server.key pi@${RPi_IP}:~/sentinel-rt/certs/
+
+# Set correct permissions on the private key
+ssh pi@${RPi_IP} "chmod 600 ~/sentinel-rt/certs/server.key"
+```
+
+---
+
+## 12. Run the Server
+
+The server requires root privileges for two reasons:
+1. `SCHED_FIFO` scheduling (requires `CAP_SYS_NICE`)
+2. GPIO sysfs export (requires write access to `/sys/class/gpio/export`)
+
+```bash
+# On the Raspberry Pi
+cd ~/sentinel-rt
+sudo ./ims_server
+```
+
+### Expected startup output
+
+```
+[IMS] Sentinel-RT server starting...
+[IMS] mlockall() OK — memory locked for RT operation
+[IMS] Sensor manager initialised (GPIO17=vibration, GPIO27=sound, GPIO4=1-Wire, I2C1=current)
+[IMS] SCHED_FIFO priority 80 set for sensor polling thread
+[IMS] OpenSSL mTLS context loaded — server.crt / ca.crt
+[IMS] Listening on 0.0.0.0:8080
+[IMS] Ready — waiting for client connections
+```
+
+### Run as a systemd service (autostart on boot)
+
+Create `/etc/systemd/system/sentinel-rt.service`:
+
+```ini
+[Unit]
+Description=Sentinel-RT Industrial Equipment Health Dashboard
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/pi/sentinel-rt/ims_server
+WorkingDirectory=/home/pi/sentinel-rt
+User=root
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable sentinel-rt
+sudo systemctl start sentinel-rt
+sudo systemctl status sentinel-rt
+```
+
+---
+
+## 13. Run the Client
+
+The client does not need root privileges. It accepts the server IP address as a mandatory argument.
+
+```bash
+# Default: uses certs/client.crt (symlink to admin_client.crt)
+./ims_client <RPi_IP>
+
+# Example
 ./ims_client 192.168.1.42
+
+# Use a specific role certificate
+CERT=certs/operator_client.crt KEY=certs/operator_client.key ./ims_client 192.168.1.42
+```
+
+### Expected connection output
+
+```
+[CLIENT] Connecting to 192.168.1.42:8080...
+[CLIENT] TLS handshake complete — TLS 1.3, AES_256_GCM_SHA384
+[CLIENT] Authenticated as: admin_user (Role: ADMIN)
+
+Sentinel-RT> help
 ```
 
 ---
 
-## 14. Run the Python Dashboard Client
+## 14. Command Reference
 
-The Python dashboard (`clients/dashboard.py`) provides a real-time graphical view of all sensor data.
+All commands are typed at the `Sentinel-RT>` prompt in the client terminal. Commands that require elevated roles return `ERROR: permission denied` if the authenticated role does not have access.
 
-### Install dependencies
+| Command | Minimum Role | Description |
+|---|---|---|
+| `help` | VIEWER | Print a summary of available commands |
+| `whoami` | VIEWER | Display the authenticated username and RBAC role |
+| `list_units` | VIEWER | List all monitored equipment units and their current health status |
+| `get_sensors` | VIEWER | Return a single snapshot of all four sensor readings |
+| `get_health` | VIEWER | Return the computed health score and status string for each unit |
+| `get_log` | OPERATOR | Retrieve the last N entries from the event ring buffer |
+| `monitor [time]` | OPERATOR | Stream live sensor data for `time` seconds (default: 30 s); Ctrl-C to stop early |
+| `clear_log` | ADMIN | Flush the event ring buffer |
+| `quit` | VIEWER | Close the TLS session gracefully |
+
+### Example session
+
+```
+Sentinel-RT> whoami
+Username : admin_user
+Role     : ADMIN
+CN       : admin_user
+OU       : ADMIN
+
+Sentinel-RT> get_sensors
+Timestamp  : 2026-03-24T14:22:07Z
+Vibration  : 0  (NORMAL — no shock detected)
+Sound      : 1  (ALERT — noise threshold exceeded)
+Temperature: 42.312 °C
+Current    : 3.74 A
+
+Sentinel-RT> get_health
+Unit 0 — Motor A
+  Vibration  : OK
+  Sound      : WARNING (threshold: 0, reading: 1)
+  Temperature: OK  (threshold: 75 °C, reading: 42.3 °C)
+  Current    : OK  (threshold: 15 A, reading: 3.7 A)
+  Overall    : WARNING
+
+Sentinel-RT> monitor 5
+[14:22:10] V=0 S=1 T=42.4°C I=3.75A  HEALTH=WARNING
+[14:22:11] V=0 S=0 T=42.4°C I=3.76A  HEALTH=OK
+[14:22:12] V=0 S=0 T=42.5°C I=3.74A  HEALTH=OK
+[14:22:13] V=0 S=0 T=42.5°C I=3.75A  HEALTH=OK
+[14:22:14] V=1 S=0 T=42.5°C I=3.75A  HEALTH=WARNING
+Monitor session ended (5 s).
+```
+
+---
+
+## 15. Security Architecture
+
+### Mutual TLS
+
+Both server and client authenticate with X.509 certificates signed by the same private CA. Neither party will proceed past the TLS handshake without a valid certificate from the shared CA. This prevents rogue clients and rogue servers.
+
+- CA key pair: `certs/ca.crt` / `certs/ca.key`
+- Server certificate: signed by the CA, presented to clients for server authentication
+- Client certificates: four variants (one per role), each signed by the CA, presented to the server for client authentication
+
+The TLS context on the server is configured with:
+- `SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL)` — mandatory mutual authentication
+- `SSL_CTX_load_verify_locations(ctx, "certs/ca.crt", NULL)` — only certs signed by this CA are accepted
+
+### RBAC Role Mapping
+
+After a successful TLS handshake, the server calls `authorize_client()` in `common/authorization.c`. This function uses the OpenSSL API to extract the `OU` (Organisational Unit) field from the verified client certificate's Subject Distinguished Name. The OU value is mapped to one of four roles:
+
+| Certificate OU | RBAC Role | Numeric Level |
+|---|---|---|
+| `ADMIN` | Administrator | 4 (highest) |
+| `OPERATOR` | Operator | 3 |
+| `MAINTENANCE` | Maintenance technician | 2 |
+| `VIEWER` | Read-only observer | 1 (lowest) |
+
+The `authorize_client()` function returns the numeric level, which `protocol.c` checks against a per-command minimum level before dispatching the handler.
+
+### Certificate Generation Details
+
+The `quick_start.sh` script uses `openssl req` and `openssl x509` to create all certificates. Key parameters:
+
+- Key algorithm: RSA 2048-bit (or EC P-256 if preferred)
+- Validity: 3650 days (10 years) for CA; 365 days for leaf certificates
+- Subject for admin client: `/CN=admin_user/OU=ADMIN/O=SentinelRT/C=IN`
+- Subject for viewer client: `/CN=viewer_user/OU=VIEWER/O=SentinelRT/C=IN`
+
+### Network exposure
+
+The server binds to `0.0.0.0:8080` by default. In a production deployment, restrict access using `iptables`:
 
 ```bash
-pip3 install matplotlib numpy
-# Or via apt:
-sudo apt install python3-matplotlib python3-numpy
-```
-
-### Configure and run
-
-Open `clients/dashboard.py` and verify the server IP:
-
-```python
-SERVER_IP   = '192.168.1.42'    # ← Change to your RPi 4's IP
-SERVER_PORT = 8080
-```
-
-Then run:
-
-```bash
-cd ~/zephyrproject/sentinel_rt
-python3 clients/dashboard.py
-```
-
-A window opens with four real-time graphs:
-- **Vibration** (red) — events per second
-- **Sound** (blue) — duty cycle %
-- **Temperature** (orange) — degrees Celsius
-- **Current** (green) — Amperes
-
-Horizontal dashed lines show WARNING and CRITICAL thresholds.
-
-> **Note:** The dashboard is under active development. Some features may be incomplete.
-
----
-
-## 15. Command Reference
-
-Once connected (terminal client or dashboard), these commands are available:
-
-| Command | Description | Min Role |
-|---------|-------------|----------|
-| `help` | List available commands (filtered by your role) | VIEWER |
-| `whoami` | Show your certificate CN and assigned role | VIEWER |
-| `list_units` | List registered equipment units | VIEWER |
-| `get_sensors` | Raw sensor snapshot: Vib / Sound / Temp / Current | VIEWER |
-| `get_health` | Health status evaluation: HEALTHY / WARNING / CRITICAL | VIEWER |
-| `get_log` | Display the in-memory black-box event log | VIEWER |
-| `monitor [duration]` | Live 1 s telemetry stream. Press ENTER to stop | OPERATOR |
-| `clear_log` | Wipe the black-box log | ADMIN |
-| `quit` / `exit` | Gracefully disconnect | VIEWER |
-
-### `monitor` duration examples
-
-```
-monitor          ← infinite (stop with ENTER)
-monitor 30       ← 30 seconds
-monitor 5m       ← 5 minutes
-monitor 1h       ← 1 hour
-```
-
-### Role permission matrix
-
-| Command | VIEWER | OPERATOR | MAINTENANCE | ADMIN |
-|---------|:------:|:--------:|:-----------:|:-----:|
-| help, whoami, list_units, get_sensors, get_health, get_log, quit | ✅ | ✅ | ✅ | ✅ |
-| monitor | ❌ | ✅ | ✅ | ✅ |
-| clear_log | ❌ | ❌ | ❌ | ✅ |
-
----
-
-## 16. Security Architecture
-
-### How mTLS works in this system
-
-```
-CLIENT                              ZEPHYR SERVER
-  │                                       │
-  │──── TCP SYN ──────────────────────►  │
-  │◄─── TCP SYN-ACK ──────────────────  │
-  │                                       │
-  │──── TLS ClientHello ───────────────► │
-  │◄─── TLS ServerHello + server.crt ── │  ← Server proves identity
-  │──── client.crt ────────────────────► │  ← Client proves identity
-  │◄─── TLS Finished ─────────────────  │
-  │                                       │
-  │   [Both certs verified against CA]    │
-  │                                       │
-  │──── Encrypted commands ────────────► │
-  │◄─── Encrypted responses ───────────  │
-```
-
-1. **The CA is self-generated** — only certificates signed by `certs/ca.crt` are trusted.
-2. **The server certificate** is embedded in the Zephyr firmware (in `drivers/certs/certs.h`).
-3. **Client certificates** are loaded from `certs/client.crt` at runtime on the Linux side.
-4. **Roles** are embedded in the certificate's `OU` (Organizational Unit) field, e.g. `OU=ADMIN`.
-5. **MbedTLS** on Zephyr verifies the peer cert chain and extracts CN + OU via `mbedtls_x509_name`.
-
-### Certificate file roles
-
-| Certificate file | Who uses it | OU field |
-|-----------------|------------|---------|
-| `certs/admin_client.crt` | Admins — full access | `ADMIN` |
-| `certs/operator_client.crt` | Control room operators | `OPERATOR` |
-| `certs/maintenance_client.crt` | Field technicians | `MAINTENANCE` |
-| `certs/viewer_client.crt` | Read-only dashboards | `VIEWER` |
-| `certs/server.crt` | Embedded in Zephyr firmware | — |
-| `certs/ca.crt` | Distributed to all clients | — |
-
-### Regenerating certificates
-
-If certificates expire (365-day validity) or are compromised:
-
-```bash
-rm -rf certs/
-./scripts/quick_start.sh certs    # regenerate
-./scripts/gen_cert_headers.sh     # update firmware headers
-west build -b rpi_4b . --pristine # rebuild firmware
-# Then re-flash SD card
+# Allow only connections from the trusted management network
+sudo iptables -A INPUT -p tcp --dport 8080 -s 192.168.1.0/24 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 8080 -j DROP
 ```
 
 ---
 
-## 17. Sensor Health Thresholds
+## 16. Sensor Specifications and Health Thresholds
 
-Health status is evaluated once per second in `drivers/sensor_manager.c`:
+### SW-420 Vibration Sensor
 
-| Status | Vibration (events/s) | Current (A) | Action |
-|--------|---------------------|-------------|--------|
-| HEALTHY | 0 – 99 | 0 – 14.9 | None |
-| WARNING | 100 – 199 | — | Console warning |
-| CRITICAL | ≥ 200 | ≥ 15 | Written to black-box log ring buffer |
+| Parameter | Value |
+|---|---|
+| Operating voltage | 3.3 V – 5 V |
+| Output type | Digital (DO), active HIGH when vibration detected |
+| Interface | GPIO 17 (sysfs `/sys/class/gpio/gpio17/value`) |
+| Poll rate | 1 kHz (read every 1 ms in the sensor manager thread) |
+| Health threshold | Any `1` reading → VIBRATION_ALERT event logged |
+| Sensitivity | Adjustable via onboard trimmer potentiometer |
 
-Temperature threshold for CRITICAL: **80 °C**
+### KY-038 Sound Sensor
 
-To adjust thresholds, edit the `#define` values at the top of [drivers/sensor_manager.c](drivers/sensor_manager.c):
-
-```c
-#define VIB_WARNING_THRESHOLD  100.0
-#define VIB_CRITICAL_THRESHOLD 200.0
-#define TMP_CRITICAL_THRESHOLD  80.0
-#define CUR_CRITICAL_THRESHOLD  15.0
-```
-
-### Black-box log
-
-The black-box log stores CRITICAL events as timestamped strings in a 4 KB in-memory ring buffer. It is accessible via the `get_log` command. Use `clear_log` (ADMIN only) to wipe it. The buffer is lost on power cycle — this is a known limitation of the bare-metal Zephyr deployment (no filesystem). A LittleFS integration is on the roadmap.
-
----
-
-## 18. Sensor Specifications
+| Parameter | Value |
+|---|---|
+| Operating voltage | 3.3 V – 5 V |
+| Output type | Digital (DO), HIGH above acoustic threshold |
+| Interface | GPIO 27 (sysfs `/sys/class/gpio/gpio27/value`) |
+| Poll rate | 1 kHz |
+| Health threshold | Sustained HIGH for > 100 ms → SOUND_ALERT event |
+| Sensitivity | Set trimmer until DO is LOW in ambient noise, HIGH at loud events |
 
 ### DS18B20 Temperature Sensor
 
-| Property | Value |
-|----------|-------|
-| Protocol | 1-Wire (Dallas/Maxim) |
-| Supply voltage | 3.0 V – 5.5 V |
-| Range | −55 °C to +125 °C |
-| Accuracy | ±0.5 °C (−10 °C to +85 °C) |
-| Resolution | 9 – 12 bit (configurable) |
-| Conversion time | 750 ms (12-bit) |
-| Pull-up required | 4.7 kΩ on data line |
+| Parameter | Value |
+|---|---|
+| Operating voltage | 3.3 V (normal power mode) |
+| Interface | 1-Wire on GPIO 4, via kernel `w1_therm` driver |
+| Kernel sysfs path | `/sys/bus/w1/devices/28-*/w1_slave` |
+| Poll rate | 1 Hz (conversion takes ~750 ms at 12-bit resolution) |
+| Resolution | 12-bit, 0.0625 °C per LSB |
+| Operating range | −55 °C to +125 °C |
+| Health thresholds | WARNING: > 70 °C; CRITICAL: > 85 °C |
 
-> The current 1-Wire implementation in `drivers/sensors.c` issues the correct reset pulse but returns a simulated temperature. Full 1-Wire bit-bang (ROM Search 0xF0, Skip ROM 0xCC, Convert T 0x44, Read Scratchpad 0xBE) is on the roadmap.
+### ACS712 + ADS1115 Current Measurement
 
-### ACS712 Current Sensor (20 A variant)
+| Parameter | Value |
+|---|---|
+| ACS712 variant | 20 A bidirectional Hall-effect sensor |
+| ACS712 sensitivity | 100 mV/A |
+| ACS712 zero-current output | 2.5 V (nominal) |
+| ADS1115 I2C address | 0x48 |
+| ADS1115 PGA setting | ±4.096 V full-scale |
+| ADS1115 resolution | 16-bit → 0.125 mV/LSB at ±4.096 V |
+| I2C bus | `/dev/i2c-1` via `ioctl(fd, I2C_RDWR, ...)` |
+| Poll rate | 1 Hz |
+| Health thresholds | WARNING: > 12 A; CRITICAL: > 18 A |
 
-| Property | Value |
-|----------|-------|
-| Supply voltage | 5 V |
-| Sensitivity | 100 mV/A (20 A model) |
-| Zero-current output | 2.5 V (Vcc/2) |
-| Bandwidth | DC – 80 kHz |
-| Formula | `I = (V_adc × 1.5 − 2.5) / 0.100` |
-
-For the 5 A variant: sensitivity = 185 mV/A → change `0.100` to `0.185`.
-For the 30 A variant: sensitivity = 66 mV/A → change `0.100` to `0.066`.
-
-### ADS1115 ADC
-
-| Property | Value |
-|----------|-------|
-| Resolution | 16-bit |
-| Sample rate | 8 – 860 SPS (configurable) |
-| PGA range | ±0.256 V – ±6.144 V |
-| Config used | PGA = ±4.096 V, AIN0-GND, single-shot, 128 SPS |
-| I2C address | 0x48 (ADDR pin → GND) |
-
----
-
-## 19. Troubleshooting
-
-### Build Issues
-
-#### `west: command not found`
-```bash
-pip3 install --user west
-# Ensure ~/.local/bin is in your PATH:
-echo 'export PATH=$HOME/.local/bin:$PATH' >> ~/.bashrc && source ~/.bashrc
-```
-
-#### `CMake Error: find_package(Zephyr ...) failed`
-```bash
-# Ensure ZEPHYR_BASE is set and west zephyr-export was run:
-export ZEPHYR_BASE=~/zephyrproject/zephyr
-west zephyr-export
-```
-
-#### `aarch64-zephyr-elf-gcc: not found`
-The Zephyr SDK is not installed or the toolchain path is wrong.
-```bash
-~/zephyr-sdk-0.16.8/setup.sh -t aarch64-zephyr-elf
-```
-
-#### `fatal error: 'mbedtls/ssl.h' file not found`
-MbedTLS module not pulled. Run `west update` inside the workspace.
-
-#### `drivers/certs/certs.h: placeholder — regenerate`
-The cert headers contain placeholder data. You must:
-```bash
-./scripts/quick_start.sh certs    # generate PEM certs
-./scripts/gen_cert_headers.sh     # convert to C arrays
-west build -b rpi_4b . --pristine
-```
-
----
-
-### SD Card / Boot Issues
-
-#### No output on UART console
-- Verify `arm_64bit=1` and `enable_uart=1` are in `config.txt`.
-- Verify UART adapter RX is connected to RPi GPIO 14 (TX), not GPIO 15.
-- Verify baud rate is exactly **115200**.
-- Try a different USB-UART adapter (some cheap CH340 clones are unreliable).
-
-#### `*** Booting Zephyr OS ***` appears but hangs
-- Network initialization is taking time or failing. Verify the Ethernet cable is plugged in.
-- Check `prj.conf` has `CONFIG_NET_DHCPV4=y`.
-
-#### GPU rainbow screen / no boot
-- The SD card is not formatted correctly (needs MBR, not GPT).
-- `start4.elf` or `fixup4.dat` is missing or corrupted. Re-download.
-- `bcm2711-rpi-4-b.dtb` is missing. Re-download.
-- `config.txt` has a typo. Verify it exactly matches Section 10.
-
-#### `zephyr.bin` not found by bootloader
-- The filename in `config.txt` must exactly match the file on the SD card (`kernel=zephyr.bin`).
-- The SD card partition must be FAT32 (not exFAT, not ext4).
-
----
-
-### Network / TLS Issues
-
-#### `[ERROR] Accept failed` on the server
-The Ethernet interface may not have obtained an IP address yet. Watch the UART output and wait ~10 s after the `Listening on port 8080` line — DHCP negotiation can be slow.
-
-#### `Connection refused` from the client
-The server is not yet up. Wait for `[NETWORK] Waiting for connection...` in the UART output.
-
-#### `SSL_connect` error on the client / `TLS Handshake failed` on the server
-```
-Cause 1: Clock skew — certificates appear expired if the host clock is wrong.
-Fix: sudo ntpdate pool.ntp.org   (on host)
-
-Cause 2: Wrong CA cert — client is using a CA that didn't sign the server cert.
-Fix: Regenerate all certs with quick_start.sh and redistribute client.crt/key.
-
-Cause 3: Client cert role mismatch — OU field doesn't match ADMIN/OPERATOR/etc.
-Fix: Inspect the cert: openssl x509 -in certs/client.crt -noout -subject
-```
-
-#### `getsockopt(TLS_NATIVE) failed` in server log
-The TLS handshake did not complete before `authorize_client()` was called. This can happen if the client disconnects immediately after the TCP handshake. It is not a bug — the server logs the error and moves on.
-
----
-
-### Hardware / Sensor Issues
-
-#### I2C device not initialising (`[HW] ERROR: I2C device not ready`)
-- Verify SDA/SCL are connected to GPIO 2 / GPIO 3 (physical pins 3/5).
-- Verify `&i2c1 { status = "okay"; }` is in `boards/rpi_4b.overlay`.
-- Verify `CONFIG_I2C=y` is in `prj.conf`.
-- Power cycle the ADS1115 board.
-
-#### Current always reads 0 A
-- The ACS712 requires **5 V** supply (not 3.3 V). Check Pin 2 of the RPi.
-- Verify the ACS712 OUT pin is connected to ADS1115 channel A0.
-- Check I2C is working: add `printk` inside `hw_read_current_i2c()` to log the raw ADC value.
-
-#### Vibration / Sound always 0
-- Verify the sensor DO pin is connected to the correct GPIO.
-- Adjust the sensitivity potentiometer on the sensor module until the onboard LED reacts.
-- Check `CONFIG_GPIO=y` is in `prj.conf`.
-
-#### Temperature returns simulated value (25–26 °C regardless of real temp)
-The full 1-Wire protocol is not yet implemented. The reset pulse is sent, but temperature reading is mocked. This is a known limitation — see [roadmap](#21-future-roadmap).
-
----
-
-### Finding the RPi 4 IP Address
-
-If DHCP assigned an IP but you don't know what it is, use any of these methods:
-
-```bash
-# 1. nmap ping scan of your subnet
-nmap -sn 192.168.1.0/24
-
-# 2. arp-scan (shows MAC addresses)
-sudo arp-scan --localnet | grep -i "raspberry\|b8:27:eb\|dc:a6:32\|e4:5f:01"
-
-# 3. Check your router's admin page
-#    Usually at http://192.168.1.1 or http://192.168.0.1
-```
-
-To print the IP from Zephyr on boot, you can add to `apps/server.c` after DHCP completes:
+### Conversion formula
 
 ```c
-#include <zephyr/net/net_if.h>
-struct net_if *iface = net_if_get_default();
-struct in_addr *addr = &iface->config.ip.ipv4->unicast[0].address.in_addr;
-printk("[NETWORK] IP: %d.%d.%d.%d\n",
-       addr->s4_addr[0], addr->s4_addr[1],
-       addr->s4_addr[2], addr->s4_addr[3]);
+// Raw 16-bit signed integer from ADS1115 AIN0 in single-ended mode
+// PGA = ±4.096 V → LSB = 4.096 / 32768 V
+double voltage = adc_raw * (4.096 / 32768.0);
+double current_A = (voltage - 2.5) / 0.100;   // 100 mV/A sensitivity
 ```
 
 ---
 
-## 20. Project Architecture Deep-Dive
+## 17. Benchmarks Overview
 
-### Data flow from sensor to client
+The `tests/` directory contains pairs of RT-bench programs ported to both **QNX Neutrino 8.0** and **Linux-RT**. These are used to quantitatively compare the two platforms' real-time characteristics. See `benchmark_test.md` in this repository for the full methodology, build instructions, results tables, and a Python plotting script.
 
-```
-[GPIO pin (1 kHz)]
-        │
-        ▼
-polling_thread()  in sensor_manager.c
-        │  accumulates vib/sound counts for 1000 ms
-        │  reads temp (1-Wire) and current (I2C) once per second
-        │  evaluates HEALTHY / WARNING / CRITICAL
-        │  locks data_mutex, writes current_health, unlocks
-        │
-        ▼
-manager_get_health()   ← called from protocol.c handlers
-        │  locks data_mutex, copies current_health, unlocks
-        │
-        ▼
-cmd_get_sensors() / cmd_get_health() / cmd_monitor()
-        │  formats string buffer
-        │
-        ▼
-send_response()   →   zsock_send(tls_fd, ...)
-        │
-        ▼
-[Encrypted TLS stream over Ethernet]
-        │
-        ▼
-ims_client / dashboard.py on workstation
-```
+### Benchmark programs
 
-### Threading model
+| Test | QNX source | Linux-RT source | What it measures |
+|---|---|---|---|
+| SHA-256 | `bench_sha_qnx.c` | `bench_sha_linuxrt.c` | Cryptographic hash execution time jitter |
+| MATRIX1 | `bench_matrix1_qnx.c` | `bench_matrix1_linuxrt.c` | Dense matrix multiply execution time jitter |
+| MD5 | `bench_md5_qnx.c` | `bench_md5_linuxrt.c` | MD5 hash execution time jitter |
+| BINARYSEARCH | `bench_binarysearch_qnx.c` | `bench_binarysearch_linuxrt.c` | Sorted-array binary search execution time jitter |
+| FIR2DIM | `bench_fir2dim_qnx.c` | `bench_fir2dim_linuxrt.c` | 2-D FIR filter execution time jitter |
 
-| Thread | Stack | Purpose |
-|--------|-------|---------|
-| `main` (Zephyr entry) | 8192 B | Hardware init, TLS setup, accept loop |
-| `polling_thread` (pthread) | 4096 B | 1 kHz sensor polling + health evaluation |
-| Per-client worker (pthread) | 4096 B | One per connected client (max 32) |
+### Build and run the Linux-RT benchmarks
 
-All threads use POSIX pthreads via Zephyr's POSIX compatibility layer (`CONFIG_PTHREAD_IPC=y`). Mutexes (`pthread_mutex_t`) protect `current_health` (sensor data) and `s_log_buf` (black-box ring buffer).
+```bash
+cd tests/
 
-### TLS credential loading sequence
+# Build a single benchmark
+gcc -O2 -o bench_sha bench_sha_linuxrt.c -lm
 
-```
-main()
-  └─ setup_tls_credentials()
-       ├─ tls_credential_add(TLS_CA_TAG,   ca_cert_der,     ...)
-       ├─ tls_credential_add(TLS_CERT_TAG, server_cert_der, ...)
-       └─ tls_credential_add(TLS_KEY_TAG,  server_key_der,  ...)
+# Run with SCHED_FIFO (requires root or rtprio capability)
+sudo chrt -f 80 ./bench_sha
 
-create_tls_listen_socket()
-  ├─ zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TLS_1_2)
-  ├─ zsock_setsockopt(SOL_TLS, TLS_SEC_TAG_LIST, {1,2,3})
-  ├─ zsock_setsockopt(SOL_TLS, TLS_PEER_VERIFY, REQUIRED)
-  ├─ zsock_bind(...)
-  └─ zsock_listen(...)
-
-accept loop:
-  └─ zsock_accept()          ← TLS handshake on first I/O
-       └─ authorize_client(client_fd)
-            ├─ getsockopt(TLS_NATIVE) → mbedtls_ssl_context*
-            ├─ mbedtls_ssl_get_peer_cert()
-            └─ walk X.509 subject for CN + OU → UserRole
+# Build all Linux-RT benchmarks at once
+for b in sha matrix1 md5 binarysearch fir2dim; do
+    gcc -O2 -o bench_${b} bench_${b}_linuxrt.c -lm
+done
 ```
 
 ---
 
-## 21. Future Roadmap
+## 18. Troubleshooting
 
-| Status | Item |
-|--------|------|
-| ✅ Done | Zephyr RTOS migration from QNX |
-| ✅ Done | Zephyr GPIO driver for vibration + sound sensors |
-| ✅ Done | Zephyr I2C driver for ADS1115 + ACS712 current sensor |
-| ✅ Done | Zephyr TLS server with MbedTLS (replaces OpenSSL) |
-| ✅ Done | MbedTLS X.509 peer cert parsing for RBAC |
-| ✅ Done | In-memory black-box ring buffer (replaces file I/O) |
-| 🔄 In progress | Full DS18B20 1-Wire protocol (bit-bang ROM commands) |
-| 🔄 In progress | Python dashboard stability and feature completion |
-| 📋 Planned | LittleFS on SPI flash for persistent black-box log |
-| 📋 Planned | Print assigned DHCP IP on UART boot output |
-| 📋 Planned | Zephyr shell integration for on-device diagnostics |
-| 📋 Planned | OTA firmware update via Zephyr MCUboot |
-| 📋 Planned | CSV export of historical sensor data |
-| 📋 Planned | Web-based monitoring dashboard |
+### 1. `sudo ./ims_server` exits immediately with "mlockall failed: ENOMEM"
+
+The process ran out of lockable memory. Increase the memlock limit:
+
+```bash
+sudo tee -a /etc/security/limits.conf <<'EOF'
+root  hard  memlock  unlimited
+root  soft  memlock  unlimited
+EOF
+# Log out and back in, then retry
+sudo ./ims_server
+```
+
+### 2. `./ims_client` fails with "SSL handshake error: certificate verify failed"
+
+The client certificate was not signed by the CA the server trusts, or the certificate has expired. Regenerate all certificates:
+
+```bash
+rm -rf certs/
+./scripts/quick_start.sh
+```
+
+Then re-deploy `certs/ca.crt`, `certs/server.crt`, and `certs/server.key` to the RPi.
+
+### 3. `cat /sys/kernel/realtime` prints nothing or the file does not exist
+
+The running kernel does not have PREEMPT_RT. Check `uname -a`; if it does not contain "PREEMPT_RT", reinstall the RT kernel as described in Section 6 and reboot.
+
+### 4. I2C address 0x48 not visible in `i2cdetect -y 1`
+
+- Confirm `/boot/config.txt` contains `dtparam=i2c_arm=on` and the system has been rebooted.
+- Check wiring: SDA to Pin 3, SCL to Pin 5, VDD to 3.3 V.
+- Verify the ADS1115 ADDR pin is tied to GND (for address 0x48). Tying ADDR to VDD gives 0x49.
+
+### 5. DS18B20 not appearing in `/sys/bus/w1/devices/`
+
+- Confirm `/boot/config.txt` contains `dtoverlay=w1-gpio,gpiopin=4`.
+- Confirm the 4.7 kΩ pull-up resistor is present between the DATA line and 3.3 V.
+- After editing `/boot/config.txt`, a reboot is required before the overlay takes effect.
+- Check that the `w1_therm` and `wire` kernel modules are loaded: `lsmod | grep w1`.
+
+### 6. `drivers/sensors.c` compile error: "i2c/smbus.h: No such file or directory"
+
+Install the i2c-tools development package:
+
+```bash
+sudo apt install -y libi2c-dev
+```
+
+### 7. Server reports "SCHED_FIFO: Operation not permitted"
+
+The server process does not have the `CAP_SYS_NICE` capability. Run it as root (`sudo ./ims_server`) or grant the capability to the binary:
+
+```bash
+sudo setcap cap_sys_nice+ep ./ims_server
+./ims_server   # No sudo needed after this
+```
+
+### 8. `get_sensors` returns temperature = -999 or "sensor error"
+
+The w1_therm file exists but the CRC check fails (the line ends in `NO`). Common causes:
+- Missing or wrong-value pull-up resistor (must be 4.7 kΩ, not 10 kΩ).
+- Long wire length causing signal integrity issues — shorten or use a proper twisted-pair cable.
+- Multiple DS18B20 sensors on the same bus with address collision — check each sensor's 64-bit ROM code.
+
+### 9. Client hangs after "Connecting to..."
+
+- Verify the server is running: `ssh pi@<IP> "pgrep ims_server"`.
+- Check firewall: `sudo iptables -L -n | grep 8080`. If the port is blocked, allow it: `sudo iptables -A INPUT -p tcp --dport 8080 -j ACCEPT`.
+- Confirm the RPi IP address is correct: `ssh pi@<IP> "hostname -I"`.
+
+### 10. Vibration sensor always reads 0 (or always reads 1)
+
+- If always 0: the sensor's sensitivity trimmer is set too high. Tap the module and watch if it ever triggers.
+- If always 1: the trimmer is set too low, triggering constantly. Turn the trimmer clockwise to increase the threshold.
+- Verify the DO pin is connected to GPIO 17 (physical pin 11, not physical pin 12 which is GPIO 18).
+
+### 11. `make` fails with "libssl not found"
+
+```bash
+sudo apt install -y libssl-dev
+# If on a 64-bit OS building for 64-bit:
+ldconfig -p | grep libssl
+```
+
+### 12. `monitor` command disconnects after exactly 30 seconds even when a longer time was requested
+
+Check the `DEFAULT_MONITOR_TIMEOUT` constant in `protocol/protocol.h`. The monitor loop enforces a server-side maximum. ADMIN and OPERATOR roles may have a longer limit than VIEWER.
 
 ---
 
-## Quick Reference Card
+## 19. Quick Reference Card
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                 SENTINEL-RT QUICK REFERENCE                 │
-├─────────────────────────────────────────────────────────────┤
-│ FIRST TIME SETUP                                            │
-│  1. Install Zephyr SDK:  ~/zephyr-sdk-X.Y.Z/setup.sh       │
-│  2. Init workspace:      west init ~/zephyrproject          │
-│                          cd ~/zephyrproject && west update  │
-│  3. Clone project into workspace                            │
-│                                                             │
-│ EVERY BUILD CYCLE                                           │
-│  1. Generate certs:      ./scripts/quick_start.sh certs    │
-│  2. Convert to headers:  ./scripts/gen_cert_headers.sh     │
-│  3. Build Zephyr image:  west build -b rpi_4b .            │
-│  4. Copy to SD card:     cp build/zephyr/zephyr.bin /mnt/  │
-│  5. Build Linux client:  make client_linux                  │
-│                                                             │
-│ SD CARD CONTENTS                                            │
-│  bcm2711-rpi-4-b.dtb  start4.elf  fixup4.dat               │
-│  zephyr.bin           config.txt                            │
-│                                                             │
-│ config.txt                                                  │
-│  kernel=zephyr.bin                                          │
-│  arm_64bit=1                                                │
-│  enable_uart=1                                              │
-│  uart_2ndstage=1                                            │
-│                                                             │
-│ UART CONSOLE: GPIO14(TX)→Adapter RX, 115200 baud           │
-│  picocom -b 115200 /dev/ttyUSB0                             │
-│                                                             │
-│ CONNECT CLIENT                                              │
-│  ./ims_client <RPi4_IP>                                     │
-│  python3 clients/dashboard.py                               │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                   SENTINEL-RT QUICK REFERENCE                    │
+├──────────────────────────────────────────────────────────────────┤
+│  PREREQUISITES (RPi 4)                                           │
+│  sudo apt install gcc libssl-dev openssl i2c-tools               │
+│                                                                  │
+│  RT KERNEL CHECK                                                 │
+│  uname -a              → must contain PREEMPT_RT                 │
+│  cat /sys/kernel/realtime  → must print 1                        │
+│                                                                  │
+│  /boot/config.txt                                                │
+│  dtparam=i2c_arm=on                                              │
+│  dtoverlay=w1-gpio,gpiopin=4                                     │
+│                                                                  │
+│  BUILD                                                           │
+│  ./scripts/quick_start.sh   ← generate certs                    │
+│  make                        ← build server + client             │
+│  CC=aarch64-linux-gnu-gcc make  ← cross-compile                 │
+│                                                                  │
+│  DEPLOY                                                          │
+│  ./scripts/quick_start.sh deploy <IP>                            │
+│                                                                  │
+│  RUN                                                             │
+│  sudo ./ims_server            ← on RPi (root required)           │
+│  ./ims_client <RPi_IP>        ← on client machine                │
+│                                                                  │
+│  COMMANDS                                                        │
+│  help / whoami / list_units / get_sensors / get_health           │
+│  get_log  (OPERATOR+)                                            │
+│  monitor [sec]  (OPERATOR+)                                      │
+│  clear_log  (ADMIN only)                                         │
+│  quit                                                            │
+│                                                                  │
+│  GPIO PINS                                                       │
+│  GPIO 17  ← SW-420 vibration (DO)                               │
+│  GPIO 27  ← KY-038 sound (DO)                                   │
+│  GPIO  4  ← DS18B20 temperature (1-Wire)                        │
+│  GPIO  2  ← I2C SDA (ADS1115)                                   │
+│  GPIO  3  ← I2C SCL (ADS1115)                                   │
+│                                                                  │
+│  RBAC ROLES (cert OU field)                                      │
+│  ADMIN > OPERATOR > MAINTENANCE > VIEWER                         │
+│                                                                  │
+│  HEALTH THRESHOLDS                                               │
+│  Temperature: WARNING >70°C  CRITICAL >85°C                     │
+│  Current    : WARNING >12 A  CRITICAL >18 A                     │
+│  Vibration  : any pulse → ALERT                                  │
+│  Sound      : sustained >100 ms → ALERT                          │
+└──────────────────────────────────────────────────────────────────┘
 ```
-
----
-
-**Author:** Hemanth Kumar
-**GitHub:** [@Hemanthkumar04](https://github.com/Hemanthkumar04)
-**Email:** hky21.github@gmail.com
-**Project Type:** Final Year Project — Industrial Equipment Health Monitoring System (IEHMS)
-**License:** Academic / Open Source
