@@ -25,10 +25,10 @@
 CC = gcc
 
 INCLUDES     = -I./apps -I./common -I./drivers -I./protocol
-CFLAGS       = -D_GNU_SOURCE -Wall -Wextra -O2 $(INCLUDES)
+CFLAGS       = -D_GNU_SOURCE -Wall -Wextra -O2 $(INCLUDES) $(EXTRA_CFLAGS)
 
-LIBS_SERVER  = -lssl -lcrypto -lpthread -lrt -lm
-LIBS_CLIENT  = -lssl -lcrypto -lpthread
+LIBS_SERVER  = -lssl -lcrypto -lpthread -lrt -lm $(EXTRA_LDFLAGS)
+LIBS_CLIENT  = -lssl -lcrypto -lpthread $(EXTRA_LDFLAGS)
 
 SRC_SERVER = apps/server.c \
              common/authorization.c \

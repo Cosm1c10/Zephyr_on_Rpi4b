@@ -146,7 +146,7 @@ void cmd_list_units(ProtocolContext *ctx) {
     int count = manager_list_units(ctx->sensor_mgr, list, MAX_UNITS);
     send_response(ctx, "=== Registered Units ===\n");
     for (int i = 0; i < count; i++) {
-        char buf[MAX_ID_LENGTH + 8];
+        char buf[256];
         snprintf(buf, sizeof(buf), " - %s\n", list[i]);
         send_response(ctx, buf);
     }
