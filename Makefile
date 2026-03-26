@@ -27,7 +27,7 @@ CC = gcc
 INCLUDES     = -I./apps -I./common -I./drivers -I./protocol
 CFLAGS       = -D_GNU_SOURCE -Wall -Wextra -O2 $(INCLUDES)
 
-LIBS_SERVER  = -lssl -lcrypto -lpthread -lrt
+LIBS_SERVER  = -lssl -lcrypto -lpthread -lrt -lm
 LIBS_CLIENT  = -lssl -lcrypto -lpthread
 
 SRC_SERVER = apps/server.c \
