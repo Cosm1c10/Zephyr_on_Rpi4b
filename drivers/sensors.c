@@ -61,9 +61,9 @@ static int current_sim_mode  = 0;   /* 1 = no I2C,     use simulation */
 static unsigned long sim_tick = 0;  /* incremented each sensor read   */
 
 static float sim_temperature(void) {
-    /* 34–37 °C, gentle ~2-minute oscillation */
+    /* 30–32 °C, gentle slow oscillation (room temperature range) */
     sim_tick++;
-    return 35.5f + 1.5f * (float)sin(sim_tick * 0.004);
+    return 31.0f + 1.0f * (float)sin(sim_tick * 0.003);
 }
 
 static float sim_current(void) {
